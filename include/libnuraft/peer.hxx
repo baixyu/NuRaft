@@ -52,6 +52,7 @@ public:
         , last_accepted_log_idx_(0)
         , next_batch_size_hint_in_bytes_(0)
         , matched_idx_(0)
+        , last_ack_term_(0)
         , busy_flag_(false)
         , pending_commit_flag_(false)
         , hb_enabled_(false)
@@ -183,6 +184,14 @@ public:
 
     void set_matched_idx(ulong idx) {
         matched_idx_ = idx;
+    }
+
+    ulong get_last_ack_term() const {
+        return last_ack_term_;
+    }
+
+    void set_last_ack_term(ulong term) {
+        last_ack_term_ = term;
     }
 
     void set_pending_commit() {
@@ -420,6 +429,15 @@ private:
      * The last log index whose term matches up with the leader.
      */
     ulong matched_idx_;
+
+    /**
+     * The Leader term in which `matched_idx_` was last advanced by an
+     * accepted append_entries response.  Zero after (re)connect or before any
+     * accepted response.  A caller (see `raft_server::peer_info`) may treat
+     * `matched_idx_` as current-term durable evidence only while this field
+     * equals its own current term.
+     */
+    ulong last_ack_term_;
 
     /**
      * `true` if we sent message to this server and waiting for

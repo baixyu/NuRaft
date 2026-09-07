@@ -373,6 +373,7 @@ void raft_server::handle_log_sync_resp(resp_msg& resp) {
         srv_to_join_->resume_hb_speed();
         srv_to_join_->set_next_log_idx(resp.get_next_idx());
         srv_to_join_->set_matched_idx(resp.get_next_idx() - 1);
+        srv_to_join_->set_last_ack_term(state_->get_term());
         sync_log_to_new_srv(resp.get_next_idx());
     } else {
         p_wn("got log sync resp while srv_to_join is null");

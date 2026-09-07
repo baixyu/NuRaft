@@ -359,6 +359,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
                 p_db("snapshot sync is done (raw type)");
                 p->set_next_log_idx(sync_ctx->get_snapshot()->get_last_log_idx() + 1);
                 p->set_matched_idx(sync_ctx->get_snapshot()->get_last_log_idx());
+                p->set_last_ack_term(state_->get_term());
                 clear_snapshot_sync_ctx(*p);
 
                 need_to_catchup = p->clear_pending_commit() ||

@@ -1721,6 +1721,8 @@ raft_server::peer_info raft_server::get_peer_info(int32 srv_id) const {
     ret.id_ = pp->get_id();
     ret.last_log_idx_ = pp->get_last_accepted_log_idx();
     ret.last_succ_resp_us_ = pp->get_resp_timer_us();
+    ret.matched_idx_ = pp->get_matched_idx();
+    ret.last_ack_term_ = pp->get_last_ack_term();
     return ret;
 }
 
@@ -1735,6 +1737,8 @@ std::vector<raft_server::peer_info> raft_server::get_peer_info_all() const {
         pi.id_ = pp->get_id();
         pi.last_log_idx_ = pp->get_last_accepted_log_idx();
         pi.last_succ_resp_us_ = pp->get_resp_timer_us();
+        pi.matched_idx_ = pp->get_matched_idx();
+        pi.last_ack_term_ = pp->get_last_ack_term();
         ret.push_back(pi);
     }
     return ret;

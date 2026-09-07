@@ -259,6 +259,7 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                  p->get_id(), p_next_log_idx, p->get_matched_idx());
             p->set_next_log_idx(0);
             p->set_matched_idx(0);
+            p->set_last_ack_term(0);
         }
         p->clear_reconnection();
     }
@@ -1084,6 +1085,7 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
                  p->get_id(), prev_matched_idx, new_matched_idx);
             p->set_matched_idx(new_matched_idx);
             p->set_last_accepted_log_idx(new_matched_idx);
+            p->set_last_ack_term(state_->get_term());
         }
         cb_func::Param param(id_, leader_, p->get_id());
         param.ctx = &new_matched_idx;

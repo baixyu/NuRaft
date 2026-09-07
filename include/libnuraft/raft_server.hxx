@@ -618,6 +618,8 @@ public:
             : id_(-1)
             , last_log_idx_(0)
             , last_succ_resp_us_(0)
+            , matched_idx_(0)
+            , last_ack_term_(0)
             {}
 
         /**
@@ -635,6 +637,23 @@ public:
          * in microsecond.
          */
         ulong last_succ_resp_us_;
+
+        /**
+         * The last log index this peer is known to have replicated in its
+         * current RPC connection era: the leader-side `peer::matched_idx_`,
+         * reset to zero whenever the RPC client to this peer is re-created.
+         * Unlike `last_log_idx_` it is never a monotone high-water mark from
+         * an earlier era.
+         */
+        ulong matched_idx_;
+
+        /**
+         * The Leader term during which `matched_idx_` was last advanced, or
+         * zero when the peer has not accepted a response in any term since its
+         * last (re)connect.  `matched_idx_` is current-term durable evidence
+         * only while this field equals the caller's current term.
+         */
+        ulong last_ack_term_;
     };
 
     /**
