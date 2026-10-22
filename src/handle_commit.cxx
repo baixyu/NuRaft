@@ -478,13 +478,14 @@ bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
 
 ulong raft_server::create_snapshot(const create_snapshot_options& options) {
     auto exec_internal = [&]() {
+        const ulong state_machine_commit_idx = sm_commit_index_.load();
         uint64_t committed_idx = options.snapshot_idx_ == 0
-                                     ? sm_commit_index_
+                                     ? state_machine_commit_idx
                                      : options.snapshot_idx_;
-        if (committed_idx > sm_commit_index_) {
+        if (committed_idx > state_machine_commit_idx) {
             p_wn("requested snapshot index %" PRIu64
                  " is ahead of state-machine commit index %" PRIu64,
-                 committed_idx, sm_commit_index_);
+                 committed_idx, state_machine_commit_idx);
             return static_cast<ulong>(0);
         }
         p_in("manually create a snapshot on %" PRIu64 "", committed_idx);
