@@ -907,6 +907,10 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
             ctx_->cb_func_.call(cb_func::ReceivedAppendEntriesResp, &param);
         }
         handle_append_entries_resp(*resp);
+        {
+            cb_func::Param param(id_, leader_, resp->get_src(), resp.get());
+            ctx_->cb_func_.call(cb_func::AppendEntriesRespHandled, &param);
+        }
         break;
 
     case msg_type::install_snapshot_response:

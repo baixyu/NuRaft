@@ -229,6 +229,40 @@ public:
          * ctx: pointer to `ReqResp` instance.
          */
         ReceivedMisbehavingMessage = 29,
+
+        /**
+         * A local append batch has crossed its log-store durability barrier.
+         * ctx: pointer to AppendBatchDurabilityArgs.
+         */
+        LocalAppendBatchDurable = 30,
+
+        /**
+         * The Leader advanced its committed index.  This is the point at
+         * which it schedules local state-machine commit work.
+         * ctx: pointer to CommitIndexAdvancedArgs.
+         */
+        LeaderCommitIndexAdvanced = 31,
+
+        /**
+         * AppendEntries response processing is complete.  This is paired
+         * with ReceivedAppendEntriesResp so observers can clear per-thread
+         * response context even when the response did not advance commit.
+         * ctx: pointer to the response.
+         */
+        AppendEntriesRespHandled = 32,
+    };
+
+    struct AppendBatchDurabilityArgs {
+        uint64_t first_log_index;
+        uint64_t last_log_index;
+        uint64_t duration_us;
+        uint64_t started_at_us;
+        uint64_t ended_at_us;
+    };
+
+    struct CommitIndexAdvancedArgs {
+        uint64_t previous_index;
+        uint64_t current_index;
     };
 
     struct Param {

@@ -137,7 +137,20 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
         }
     }
     if (num_entries) {
+        const auto append_batch_started = std::chrono::steady_clock::now();
         log_store_->end_of_append_batch(last_idx - num_entries + 1, num_entries);
+        const auto append_batch_ended = std::chrono::steady_clock::now();
+        cb_func::AppendBatchDurabilityArgs durability_args{
+            last_idx - num_entries + 1, last_idx,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                append_batch_ended - append_batch_started).count()),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                append_batch_started.time_since_epoch()).count()),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                append_batch_ended.time_since_epoch()).count())};
+        cb_func::Param durability_param(id_, leader_);
+        durability_param.ctx = &durability_args;
+        ctx_->cb_func_.call(cb_func::LocalAppendBatchDurable, &durability_param);
     }
     try_update_precommit_index(last_idx);
     resp_idx = log_store_->next_slot();

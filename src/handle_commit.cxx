@@ -41,8 +41,16 @@ namespace nuraft {
 
 void raft_server::commit(ulong target_idx) {
     if (target_idx > quick_commit_index_) {
+        const ulong previous_commit_index = quick_commit_index_;
         quick_commit_index_ = target_idx;
         lagging_sm_target_index_ = target_idx;
+        if (role_ == srv_role::leader) {
+            cb_func::CommitIndexAdvancedArgs args{previous_commit_index,
+                                                   target_idx};
+            cb_func::Param param(id_, leader_);
+            param.ctx = &args;
+            ctx_->cb_func_.call(cb_func::LeaderCommitIndexAdvanced, &param);
+        }
         p_db( "trigger commit upto %" PRIu64 "", quick_commit_index_.load() );
 
         // if this is a leader notify peers to commit as well
