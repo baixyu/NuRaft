@@ -250,6 +250,13 @@ public:
          * ctx: pointer to the response.
          */
         AppendEntriesRespHandled = 32,
+
+        /**
+         * NuRaft's commit worker is starting to process an application log
+         * entry in commit_app_log(), before calling state_machine::commit_ext().
+         * ctx: pointer to `ulong` (log index).
+         */
+        StateMachineCommitStarted = 33,
     };
 
     struct AppendBatchDurabilityArgs {

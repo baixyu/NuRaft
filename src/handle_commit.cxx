@@ -303,6 +303,10 @@ void raft_server::commit_app_log(ulong idx_to_commit,
                                  ptr<log_entry>& le,
                                  bool need_to_handle_commit_elem)
 {
+    cb_func::Param started_param(id_, leader_);
+    started_param.ctx = &idx_to_commit;
+    ctx_->cb_func_.call(cb_func::StateMachineCommitStarted, &started_param);
+
     ptr<buffer> ret_value = nullptr;
     ptr<buffer> buf = le->get_buf_ptr();
     buf->pos(0);
@@ -474,12 +478,20 @@ bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
 
 ulong raft_server::create_snapshot(const create_snapshot_options& options) {
     auto exec_internal = [&]() {
-        uint64_t committed_idx = sm_commit_index_;
+        uint64_t committed_idx = options.snapshot_idx_ == 0
+                                     ? sm_commit_index_
+                                     : options.snapshot_idx_;
+        if (committed_idx > sm_commit_index_) {
+            p_wn("requested snapshot index %" PRIu64
+                 " is ahead of state-machine commit index %" PRIu64,
+                 committed_idx, sm_commit_index_);
+            return static_cast<ulong>(0);
+        }
         p_in("manually create a snapshot on %" PRIu64 "", committed_idx);
         return snapshot_and_compact(committed_idx, true) ? committed_idx : 0;
     };
 
-    if (options.serialize_commit_) {
+    if (options.serialize_commit_ || options.snapshot_idx_ != 0) {
         auto_lock(commit_lock_);
         return exec_internal();
     } else {

@@ -850,7 +850,7 @@ public:
      */
     struct create_snapshot_options {
         create_snapshot_options()
-            : serialize_commit_(false)
+            : serialize_commit_(false), snapshot_idx_(0)
             {}
         /**
          * If `true`, the background commit will be blocked until `create_snapshot`
@@ -862,6 +862,12 @@ public:
          * the snapshot creation is the most recent one.
          */
         bool serialize_commit_;
+        /**
+         * Optional exact snapshot index. Zero selects the latest state-machine
+         * commit index, preserving the historical API behavior. A non-zero
+         * value is accepted only when it is already committed and retained.
+         */
+        ulong snapshot_idx_;
     };
 
     /**
