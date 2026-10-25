@@ -1101,7 +1101,12 @@ public:
     bool verify_certificate(bool preverified,
                             asio::ssl::verify_context& ctx)
     {
-        if (impl_->get_options().verify_sn_) {
+        // The subject-name callback is a peer identity check.  Apply it only
+        // to the leaf certificate; intermediate and root certificates are
+        // authenticated by the configured CA chain and normally do not name
+        // a Raft member.
+        if (impl_->get_options().verify_sn_ &&
+            X509_STORE_CTX_get_error_depth(ctx.native_handle()) == 0) {
             char subject_name[256];
             X509* cert = X509_STORE_CTX_get_current_cert( ctx.native_handle() );
             X509_NAME_oneline( X509_get_subject_name(cert), subject_name, 256 );
