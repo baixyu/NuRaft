@@ -47,6 +47,8 @@ public:
         , next_idx_(next_idx)
         , next_batch_size_hint_in_bytes_(0)
         , accepted_(accepted)
+        , read_index_probe_generation_(0)
+        , read_index_probe_only_(false)
         , ctx_(nullptr)
         , cb_func_(nullptr)
         , async_cb_func_(nullptr)
@@ -70,6 +72,23 @@ public:
 
     bool get_accepted() const {
         return accepted_;
+    }
+
+    // Leader-local correlation copied from the original request by peer.
+    uint64_t get_read_index_probe_generation() const {
+        return read_index_probe_generation_;
+    }
+
+    void set_read_index_probe_generation(uint64_t generation) {
+        read_index_probe_generation_ = generation;
+    }
+
+    bool is_read_index_probe_only() const {
+        return read_index_probe_only_;
+    }
+
+    void set_read_index_probe_only(bool value) {
+        read_index_probe_only_ = value;
     }
 
     void accept(ulong next_idx) {
@@ -131,6 +150,10 @@ private:
     ulong next_idx_;
     int64 next_batch_size_hint_in_bytes_;
     bool accepted_;
+    // Process-local ReadIndex correlation; not part of the wire format.
+    uint64_t read_index_probe_generation_;
+    // Leader-local marker copied from the original request by peer.
+    bool read_index_probe_only_;
     ptr<buffer> ctx_;
     ptr<peer> peer_;
     resp_cb cb_func_;

@@ -25,10 +25,12 @@ limitations under the License.
 #include "debugging_options.hxx"
 #include "error_code.hxx"
 #include "global_mgr.hxx"
+#include "peer.hxx"
 #include "state_machine.hxx"
 #include "state_mgr.hxx"
 #include "tracer.hxx"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <sstream>
@@ -80,6 +82,119 @@ void raft_server::request_append_entries_for_all() {
         recur_lock(lock_);
         request_append_entries();
     }
+}
+
+raft_server::read_index_probe_result raft_server::request_read_index_probe(
+    uint64_t timeout_ms) {
+    read_index_probe_result result;
+    recur_lock(lock_);
+    if (role_ != srv_role::leader || !initialized_ || stopping_) return result;
+
+    const auto config = get_config();
+    if (config == nullptr) return result;
+    const auto self = config->get_server(id_);
+    if (self == nullptr || self->is_learner() || self->is_new_joiner()) {
+        result.status_ = read_index_probe_result::status::local_not_voter;
+        return result;
+    }
+
+    // Capture the read index, local voting eligibility, and configuration
+    // version under the same lock that constructs the AppendEntries probes.
+    // Each probe request carries this read index or a newer committed prefix.
+    result.term_ = state_->get_term();
+    result.safe_read_index_ = quick_commit_index_.load();
+    result.config_log_index_ = config->get_log_idx();
+
+    uint64_t generation = ++next_read_index_probe_generation_;
+    if (generation == 0) generation = ++next_read_index_probe_generation_;
+
+    for (auto &entry : peers_) {
+        ptr<peer> p = entry.second;
+        {
+            auto_lock(p->get_lock());
+            if (!is_regular_member(p)) continue;
+            p->set_pending_read_index_probe_generation(generation);
+        }
+        dispatch_pending_read_index_probe(p, timeout_ms);
+    }
+
+    // Drive the regular voters immediately with a separate empty AppendEntries
+    // probe. It can overlap the ordinary replication RPC without changing the
+    // peer's replication cursor.
+    result.status_ = read_index_probe_result::status::started;
+    result.generation_ = generation;
+    return result;
+}
+
+ptr<req_msg> raft_server::create_read_index_probe_req(
+    ptr<peer>& p, uint64_t generation) {
+    if (role_ != srv_role::leader || generation == 0) return nullptr;
+
+    const ulong first_retained_idx = log_store_->start_index();
+    const ulong min_prev_idx = first_retained_idx == 0
+                                   ? 0
+                                   : first_retained_idx - 1;
+    ulong prev_idx = std::max(p->get_matched_idx(), min_prev_idx);
+    const ulong prev_term = term_for_log(prev_idx);
+    ptr<req_msg> request = cs_new<req_msg>(
+        state_->get_term(), msg_type::append_entries_request, id_, p->get_id(),
+        prev_term, prev_idx, quick_commit_index_.load());
+    request->set_read_index_probe_generation(generation);
+    request->set_read_index_probe_only(true);
+    return request;
+}
+
+void raft_server::dispatch_pending_read_index_probe(ptr<peer>& p,
+                                                   uint64_t timeout_ms) {
+    if (role_ != srv_role::leader) return;
+    const uint64_t generation = p->begin_read_index_probe();
+    if (generation == 0) return;
+
+    ptr<req_msg> request = create_read_index_probe_req(p, generation);
+    if (request == nullptr) {
+        p->complete_read_index_probe(generation);
+        return;
+    }
+
+    cb_func::Param request_param(id_, leader_, p->get_id(), request.get());
+    if (ctx_->cb_func_.call(cb_func::RequestAppendEntries, &request_param) ==
+        CbReturnCode::ReturnNull) {
+        p->complete_read_index_probe(generation);
+        return;
+    }
+
+    rpc_handler handler = [this, p, generation](
+                              ptr<resp_msg>& response,
+                              ptr<rpc_exception>& error) {
+        handle_read_index_probe_resp(p, generation, response, error);
+    };
+    if (!p->send_req(p, request, handler, true, true,
+                     std::max<std::uint64_t>(timeout_ms, 1))) {
+        p->complete_read_index_probe(generation);
+        return;
+    }
+
+    cb_func::Param sent_param(id_, leader_, p->get_id(), request.get());
+    ctx_->cb_func_.call(cb_func::SentAppendEntriesReq, &sent_param);
+}
+
+void raft_server::handle_read_index_probe_resp(
+    ptr<peer> p, uint64_t generation, ptr<resp_msg>& response,
+    ptr<rpc_exception>& error) {
+    if (response) {
+        handle_peer_resp(response, error);
+    } else if (error) {
+        // A probe-channel failure must not mark the replication channel's
+        // peer as lost. The read will fail quorum confirmation and use the
+        // normal barrier fallback; a later probe recreates this socket.
+        p_wn("ReadIndex probe RPC to peer %d failed: %s",
+             p->get_id(), error->what());
+    }
+
+    recur_lock(lock_);
+    auto it = peers_.find(p->get_id());
+    if (it == peers_.end() || it->second != p) return;
+    p->complete_read_index_probe(generation);
 }
 
 ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,

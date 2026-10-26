@@ -34,6 +34,9 @@ limitations under the License.
 
 #include <list>
 #include <map>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -106,6 +109,20 @@ public:
           * If `true`, test mode is enabled.
          */
         bool test_mode_flag_;
+    };
+
+    struct read_index_probe_result {
+        enum class status {
+            not_leader,
+            local_not_voter,
+            started
+        };
+
+        status status_{status::not_leader};
+        ulong term_{0};
+        ulong safe_read_index_{0};
+        ulong config_log_index_{0};
+        uint64_t generation_{0};
     };
 
     struct limits {
@@ -259,6 +276,36 @@ public:
      */
     ptr< cmd_result< ptr<buffer> > >
         append_entries(const std::vector< ptr<buffer> >& logs);
+
+    /**
+     * Ask regular voters for an immediate AppendEntries response and return
+     * the leader-local generation attached to requests sent after this call.
+     * No log entry is appended. Each peer uses a separate RPC channel for its
+     * empty probe, so log replication in flight cannot delay the quorum round.
+     * At most one probe is in flight per peer; newer read generations share
+     * the next probe. The result captures the exact term, configuration, and
+     * read index and refuses to start when this node is not a voter.
+     */
+    read_index_probe_result request_read_index_probe(uint64_t timeout_ms);
+
+    /**
+     * Return the current response-event sequence for ReadIndex waiters.
+     * The sequence advances when a ReadIndex-tagged AppendEntries response
+     * arrives (accepted or rejected), or when a response advances the term,
+     * so callers can recheck quorum state and leadership without polling.
+     */
+    uint64_t read_index_probe_event_sequence() const {
+        return read_index_probe_event_sequence_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Wait until a peer response changes the ReadIndex event sequence or the
+     * deadline expires. Callers must inspect state before and after waiting;
+     * this is only a wakeup mechanism, not a quorum proof.
+     */
+    void wait_for_read_index_probe_event(
+        uint64_t observed_sequence,
+        std::chrono::steady_clock::time_point deadline) const;
 
     /**
      * Flip learner flag of given server.
@@ -620,6 +667,8 @@ public:
             , last_succ_resp_us_(0)
             , matched_idx_(0)
             , last_ack_term_(0)
+            , last_read_index_probe_generation_(0)
+            , is_voter_(false)
             {}
 
         /**
@@ -654,6 +703,12 @@ public:
          * only while this field equals the caller's current term.
          */
         ulong last_ack_term_;
+
+        /** Latest locally correlated ReadIndex AppendEntries response. */
+        uint64_t last_read_index_probe_generation_;
+
+        /** Whether this peer participates in the current leader quorum. */
+        bool is_voter_;
     };
 
     /**
@@ -669,7 +724,17 @@ public:
      *
      * @return Vector of peer info.
      */
-    std::vector<peer_info> get_peer_info_all() const;
+    std::vector<peer_info> get_peer_info_all(
+        ulong* config_log_index_out = nullptr) const;
+    /**
+     * Fill a caller-owned vector of all peer info. Reusing its capacity avoids
+     * a fresh allocation on repeated ReadIndex quorum snapshots.
+     */
+    void get_peer_info_all(std::vector<peer_info>& peers_out,
+                           ulong* config_log_index_out) const;
+
+    /** Total ReadIndex RPC pool allocation failures caused by all slots being busy. */
+    uint64_t get_read_index_rpc_pool_saturation_count() const;
 
     /**
      * Shut down server instance.
@@ -965,6 +1030,7 @@ protected:
     bool check_leadership_validity();
     void check_leadership_transfer();
     void update_rand_timeout();
+    void notify_read_index_probe_waiters();
     void cancel_global_requests();
 
     bool is_regular_member(const ptr<peer>& p);
@@ -1033,6 +1099,12 @@ protected:
     void handle_join_leave_rpc_err(msg_type t_msg, ptr<peer> p);
     void reset_srv_to_join();
     void reset_srv_to_leave();
+    ptr<req_msg> create_read_index_probe_req(ptr<peer>& p,
+                                             uint64_t generation);
+    void dispatch_pending_read_index_probe(ptr<peer>& p, uint64_t timeout_ms);
+    void handle_read_index_probe_resp(ptr<peer> p, uint64_t generation,
+                                      ptr<resp_msg>& resp,
+                                      ptr<rpc_exception>& err);
     ptr<req_msg> create_append_entries_req(ptr<peer>& pp, ulong custom_last_log_idx = 0);
     ptr<req_msg> create_sync_snapshot_req(ptr<peer>& pp,
                                           ulong last_log_idx,
@@ -1212,6 +1284,9 @@ protected:
      * node, which might be smaller than `leader_commit_index_` value.
      */
     std::atomic<ulong> quick_commit_index_;
+
+    /** Next process-local ReadIndex generation, protected by lock_. */
+    uint64_t next_read_index_probe_generation_{0};
 
     /**
      * Actual commit index of state machine.
@@ -1535,6 +1610,11 @@ protected:
      * Lock of entire Raft operation.
      */
     mutable std::recursive_mutex lock_;
+
+    /** ReadIndex waiters sleep here; notifications never acquire `lock_`. */
+    mutable std::mutex read_index_probe_wait_mutex_;
+    mutable std::condition_variable read_index_probe_wait_cv_;
+    std::atomic<uint64_t> read_index_probe_event_sequence_{0};
 
     /**
      * Lock of handling client request and role change.

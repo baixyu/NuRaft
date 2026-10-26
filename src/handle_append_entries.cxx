@@ -375,6 +375,13 @@ bool raft_server::send_request(ptr<peer>& p,
                                ptr<req_msg>& msg,
                                rpc_handler& m_handler,
                                bool streaming) {
+    if (msg && msg->get_type() == msg_type::append_entries_request) {
+        const uint64_t pending_probe =
+            p->get_pending_read_index_probe_generation();
+        if (pending_probe > p->get_last_read_index_probe_generation())
+            msg->set_read_index_probe_generation(pending_probe);
+    }
+
     if (!p->is_manual_free()) {
         // Actual recovery.
         if ( p->get_long_puase_warnings() >=

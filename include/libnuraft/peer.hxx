@@ -31,6 +31,7 @@ limitations under the License.
 
 #include <atomic>
 #include <cassert>
+#include <vector>
 
 namespace nuraft {
 
@@ -43,7 +44,8 @@ public:
           ptr<logger>& logger )
         : config_(config)
         , scheduler_(ctx.scheduler_)
-        , rpc_( ctx.rpc_cli_factory_->create_client(config->get_endpoint()) )
+        , rpc_factory_(ctx.rpc_cli_factory_)
+        , rpc_(rpc_factory_->create_client(config->get_endpoint()))
         , current_hb_interval_( ctx.get_params()->heart_beat_interval_ )
         , hb_interval_( ctx.get_params()->heart_beat_interval_ )
         , rpc_backoff_( ctx.get_params()->rpc_failure_backoff_ )
@@ -53,6 +55,8 @@ public:
         , next_batch_size_hint_in_bytes_(0)
         , matched_idx_(0)
         , last_ack_term_(0)
+        , pending_read_index_probe_generation_(0)
+        , last_read_index_probe_generation_(0)
         , busy_flag_(false)
         , pending_commit_flag_(false)
         , hb_enabled_(false)
@@ -194,6 +198,50 @@ public:
         last_ack_term_ = term;
     }
 
+    // All accesses are protected by raft_server::lock_.
+    uint64_t get_pending_read_index_probe_generation() const {
+        return pending_read_index_probe_generation_;
+    }
+
+    uint64_t get_last_read_index_probe_generation() const {
+        return last_read_index_probe_generation_;
+    }
+
+    void set_pending_read_index_probe_generation(uint64_t generation) {
+        if (generation > pending_read_index_probe_generation_)
+            pending_read_index_probe_generation_ = generation;
+    }
+
+    void acknowledge_read_index_probe_generation(uint64_t generation) {
+        if (generation > last_read_index_probe_generation_)
+            last_read_index_probe_generation_ = generation;
+        if (generation > last_read_index_probe_attempted_generation_)
+            last_read_index_probe_attempted_generation_ = generation;
+        if (pending_read_index_probe_generation_ <= generation)
+            pending_read_index_probe_generation_ = 0;
+    }
+
+    uint64_t begin_read_index_probe() {
+        if (pending_read_index_probe_generation_ <=
+            last_read_index_probe_attempted_generation_)
+            return 0;
+        last_read_index_probe_attempted_generation_ =
+            pending_read_index_probe_generation_;
+        return pending_read_index_probe_generation_;
+    }
+
+    void complete_read_index_probe(uint64_t generation) {
+        if (generation > last_read_index_probe_attempted_generation_)
+            last_read_index_probe_attempted_generation_ = generation;
+        if (pending_read_index_probe_generation_ <= generation)
+            pending_read_index_probe_generation_ = 0;
+    }
+
+    uint64_t read_index_rpc_pool_saturations() const {
+        return read_index_rpc_pool_saturations_.load(
+            std::memory_order_relaxed);
+    }
+
     void set_pending_commit() {
         pending_commit_flag_.store(true);
     }
@@ -232,10 +280,12 @@ public:
         hb_interval_ = new_interval;
     }
 
-    void send_req(ptr<peer> myself,
+    bool send_req(ptr<peer> myself,
                   ptr<req_msg>& req,
                   rpc_handler& handler,
-                  bool streaming = false);
+                  bool streaming = false,
+                  bool read_index_channel = false,
+                  uint64_t send_timeout_ms = 0);
 
     void shutdown();
 
@@ -363,9 +413,11 @@ public:
 private:
     void handle_rpc_result(ptr<peer> myself,
                            ptr<rpc_client> my_rpc_client,
+                           size_t read_index_slot,
                            ptr<req_msg>& req,
                            ptr<rpc_result>& pending_result,
                            bool streaming,
+                           bool read_index_channel,
                            size_t req_size_bytes,
                            ptr<resp_msg>& resp,
                            ptr<rpc_exception>& err);
@@ -380,14 +432,29 @@ private:
      */
     ptr<delayed_task_scheduler> scheduler_;
 
+    /** Factory retained to recreate the isolated ReadIndex transport. */
+    ptr<rpc_client_factory> rpc_factory_;
+
     /**
      * RPC client to this server.
      */
     ptr<rpc_client> rpc_;
 
-    /**
-     * Guard of `rpc_`.
-     */
+    /** Dedicated sockets for ReadIndex probes so they do not queue behind log replication. */
+    struct read_index_rpc_slot {
+        ptr<rpc_client> rpc;
+        bool busy{false};
+    };
+
+    // asio_rpc_client supports one request per connection. Allocate lazily so
+    // concurrent strong reads do not serialize behind one socket. Keep this
+    // above the 128-client strong-read benchmark with burst headroom; pool
+    // saturation sends the read back to the periodic replication path.
+    static constexpr size_t max_read_index_rpc_slots_ = 256;
+    std::vector<read_index_rpc_slot> rpc_read_index_pool_;
+    std::atomic<uint64_t> read_index_rpc_pool_saturations_{0};
+
+    /** Guards `rpc_` and the ReadIndex RPC pool. */
     std::mutex rpc_protector_;
 
     /**
@@ -431,13 +498,19 @@ private:
     ulong matched_idx_;
 
     /**
-     * The Leader term in which `matched_idx_` was last advanced by an
-     * accepted append_entries response.  Zero after (re)connect or before any
-     * accepted response.  A caller (see `raft_server::peer_info`) may treat
-     * `matched_idx_` as current-term durable evidence only while this field
-     * equals its own current term.
+     * The Leader term in which an accepted AppendEntries response last
+     * confirmed at least `matched_idx_`. A ReadIndex heartbeat can confirm the
+     * existing prefix without advancing the replication cursor. Zero after
+     * (re)connect or before any accepted response. A caller may treat the
+     * matched prefix as current-term evidence only while this field equals its
+     * own current term.
      */
     ulong last_ack_term_;
+
+    /** Latest ReadIndex probe requested and acknowledged for this peer. */
+    uint64_t pending_read_index_probe_generation_;
+    uint64_t last_read_index_probe_generation_;
+    uint64_t last_read_index_probe_attempted_generation_{0};
 
     /**
      * `true` if we sent message to this server and waiting for

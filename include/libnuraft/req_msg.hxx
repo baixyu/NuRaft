@@ -41,6 +41,8 @@ public:
         , last_log_term_(last_log_term)
         , last_log_idx_(last_log_idx)
         , commit_idx_(commit_idx)
+        , read_index_probe_generation_(0)
+        , read_index_probe_only_(false)
         , log_entries_()
         { }
 
@@ -61,6 +63,24 @@ public:
         return commit_idx_;
     }
 
+    // Leader-local ReadIndex correlation. This is not serialized; the
+    // original request object is retained by the RPC completion callback.
+    uint64_t get_read_index_probe_generation() const {
+        return read_index_probe_generation_;
+    }
+
+    void set_read_index_probe_generation(uint64_t generation) {
+        read_index_probe_generation_ = generation;
+    }
+
+    bool is_read_index_probe_only() const {
+        return read_index_probe_only_;
+    }
+
+    void set_read_index_probe_only(bool value) {
+        read_index_probe_only_ = value;
+    }
+
     std::vector<ptr<log_entry>>& log_entries() {
         return log_entries_;
     }
@@ -78,6 +98,13 @@ private:
     // As a pipelining, follower will do commit on this index number
     // after appending given logs.
     ulong commit_idx_;
+
+    // Process-local ReadIndex correlation; not part of the wire format.
+    uint64_t read_index_probe_generation_;
+
+    // A probe-only AppendEntries may overlap a replication request. Its
+    // response must never move the peer's replication matched/next indexes.
+    bool read_index_probe_only_;
 
     // Logs. Can be empty.
     std::vector<ptr<log_entry>> log_entries_;

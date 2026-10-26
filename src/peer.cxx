@@ -28,15 +28,17 @@ limitations under the License.
 
 namespace nuraft {
 
-void peer::send_req( ptr<peer> myself,
+bool peer::send_req( ptr<peer> myself,
                      ptr<req_msg>& req,
                      rpc_handler& handler,
-                     bool streaming )
+                     bool streaming,
+                     bool read_index_channel,
+                     uint64_t send_timeout_ms )
 {
     if (abandoned_) {
         p_er("peer %d has been shut down, cannot send request",
              config_->get_id());
-        return;
+        return false;
     }
 
     if (req) {
@@ -48,15 +50,53 @@ void peer::send_req( ptr<peer> myself,
 
     ptr<rpc_result> pending = cs_new<rpc_result>(handler);
     ptr<rpc_client> rpc_local = nullptr;
+    size_t read_index_slot = 0;
+    bool read_index_pool_all_slots_busy = false;
     {   std::lock_guard<std::mutex> l(rpc_protector_);
-        if (!rpc_) {
-            // Nothing will be sent, immediately free it
-            // to serve next operation.
-            p_tr("rpc local is null");
-            set_free();
-            return;
+        if (read_index_channel) {
+            read_index_pool_all_slots_busy =
+                !rpc_read_index_pool_.empty() &&
+                rpc_read_index_pool_.size() >= max_read_index_rpc_slots_;
+            for (; read_index_slot < rpc_read_index_pool_.size();
+                 ++read_index_slot) {
+                auto &slot = rpc_read_index_pool_[read_index_slot];
+                if (slot.busy) continue;
+                read_index_pool_all_slots_busy = false;
+                if ((!slot.rpc || slot.rpc->is_abandoned()) && rpc_factory_)
+                    slot.rpc =
+                        rpc_factory_->create_client(config_->get_endpoint());
+                if (slot.rpc) {
+                    slot.busy = true;
+                    rpc_local = slot.rpc;
+                    break;
+                }
+            }
+            if (!rpc_local && rpc_read_index_pool_.size() <
+                                  max_read_index_rpc_slots_ &&
+                rpc_factory_) {
+                read_index_rpc_slot slot;
+                slot.rpc = rpc_factory_->create_client(config_->get_endpoint());
+                slot.busy = static_cast<bool>(slot.rpc);
+                if (slot.rpc) {
+                    read_index_slot = rpc_read_index_pool_.size();
+                    rpc_local = slot.rpc;
+                    rpc_read_index_pool_.push_back(std::move(slot));
+                }
+            }
+        } else {
+            rpc_local = rpc_;
         }
-        rpc_local = rpc_;
+        if (!rpc_local) {
+            // Nothing will be sent, immediately free it to serve the next
+            // operation. ReadIndex callers will fail this probe and can use
+            // the existing bounded barrier fallback.
+            if (read_index_pool_all_slots_busy)
+                read_index_rpc_pool_saturations_.fetch_add(
+                    1, std::memory_order_relaxed);
+            p_tr("rpc local is null or ReadIndex RPC pool is full");
+            if (!read_index_channel) set_free();
+            return false;
+        }
     }
 
     size_t req_size_bytes = 0;
@@ -71,16 +111,20 @@ void peer::send_req( ptr<peer> myself,
                       this,
                       myself,
                       rpc_local,
+                      read_index_slot,
                       req,
                       pending,
                       streaming,
+                      read_index_channel,
                       req_size_bytes,
                       std::placeholders::_1,
                       std::placeholders::_2 );
     if (rpc_local) {
         myself->bytes_in_flight_add(req_size_bytes);
-        rpc_local->send(req, h);
+        rpc_local->send(req, h, send_timeout_ms);
+        return true;
     }
+    return false;
 }
 
 // WARNING:
@@ -91,9 +135,11 @@ void peer::send_req( ptr<peer> myself,
 //     2) RPC client has been reset and re-connected.
 void peer::handle_rpc_result( ptr<peer> myself,
                               ptr<rpc_client> my_rpc_client,
+                              size_t read_index_slot,
                               ptr<req_msg>& req,
                               ptr<rpc_result>& pending_result,
                               bool streaming,
+                              bool read_index_channel,
                               size_t req_size_bytes,
                               ptr<resp_msg>& resp,
                               ptr<rpc_exception>& err )
@@ -113,10 +159,20 @@ void peer::handle_rpc_result( ptr<peer> myself,
 
     if (err == nilptr) {
         // Succeeded.
+        if (resp && req)
+            resp->set_read_index_probe_generation(
+                req->get_read_index_probe_generation());
+        if (resp && req)
+            resp->set_read_index_probe_only(req->is_read_index_probe_only());
         {   std::lock_guard<std::mutex> l(rpc_protector_);
             // The same as below, freeing busy flag should be done
             // only if the RPC hasn't been changed.
-            uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
+            const ptr<rpc_client> current_rpc = read_index_channel
+                ? (read_index_slot < rpc_read_index_pool_.size()
+                       ? rpc_read_index_pool_[read_index_slot].rpc
+                       : ptr<rpc_client>())
+                : rpc_;
+            uint64_t cur_rpc_id = current_rpc ? current_rpc->get_id() : 0;
             uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
             if (cur_rpc_id != given_rpc_id) {
                 int32_t stale_resps = inc_stale_rpc_responses();
@@ -141,12 +197,16 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 //   it may free the peer even though new RPC client is already created.
                 reset_stale_rpc_responses();
                 bytes_in_flight_sub(req_size_bytes);
-                try_set_free(req->get_type(), streaming);
+                if (read_index_channel &&
+                    read_index_slot < rpc_read_index_pool_.size())
+                    rpc_read_index_pool_[read_index_slot].busy = false;
+                else
+                    try_set_free(req->get_type(), streaming);
             }
         }
 
-        reset_active_timer();
-        {
+        if (!read_index_channel) {
+            reset_active_timer();
             auto_lock(lock_);
             resume_hb_speed();
         }
@@ -154,18 +214,39 @@ void peer::handle_rpc_result( ptr<peer> myself,
         resp->set_peer(myself);
         pending_result->set_result(resp, no_except);
 
-        reconn_backoff_.reset();
-        reconn_backoff_.set_duration_ms(1);
+        if (!read_index_channel) {
+            reconn_backoff_.reset();
+            reconn_backoff_.set_duration_ms(1);
+        }
 
     } else {
         // Failed.
 
         // NOTE: Explicit failure is also treated as an activity
         //       of that connection.
-        reset_active_timer();
-        {
+        if (!read_index_channel) {
+            reset_active_timer();
             auto_lock(lock_);
             slow_down_hb();
+        }
+
+        if (read_index_channel) {
+            // Retire this socket before notifying the ReadIndex completion;
+            // the callback may immediately submit another probe.
+            {
+                std::lock_guard<std::mutex> l(rpc_protector_);
+                if (read_index_slot < rpc_read_index_pool_.size()) {
+                    auto &slot = rpc_read_index_pool_[read_index_slot];
+                    if (slot.rpc && my_rpc_client &&
+                        slot.rpc->get_id() == my_rpc_client->get_id()) {
+                        slot.rpc.reset();
+                        slot.busy = false;
+                    }
+                }
+            }
+            ptr<resp_msg> no_resp;
+            pending_result->set_result(no_resp, err);
+            return;
         }
         ptr<resp_msg> no_resp;
         pending_result->set_result(no_resp, err);
@@ -173,7 +254,8 @@ void peer::handle_rpc_result( ptr<peer> myself,
         // Destroy this connection, we MUST NOT re-use existing socket.
         // Next append operation will create a new one.
         {   std::lock_guard<std::mutex> l(rpc_protector_);
-            uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
+            const ptr<rpc_client>& current_rpc = rpc_;
+            uint64_t cur_rpc_id = current_rpc ? current_rpc->get_id() : 0;
             uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
             if (cur_rpc_id == given_rpc_id) {
                 rpc_.reset();
@@ -183,9 +265,9 @@ void peer::handle_rpc_result( ptr<peer> myself,
                     p_in("stop stream mode for peer %d at idx: %" PRIu64 "",
                          config_->get_id(), last_streamed_log_idx);
                 }
-                reset_stale_rpc_responses();
                 reset_bytes_in_flight();
                 try_set_free(req->get_type(), streaming);
+                reset_stale_rpc_responses();
             } else {
                 // WARNING (MONSTOR-9378):
                 //   RPC client has been reset before this request returns
@@ -273,6 +355,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         reconn_backoff_.set_duration_ms(new_duration_ms);
 
         rpc_ = factory->create_client(config->get_endpoint());
+        rpc_read_index_pool_.clear();
         p_tr("%p reconnect peer %d", rpc_.get(), config_->get_id());
 
         // WARNING:
@@ -302,6 +385,7 @@ void peer::shutdown() {
         // (race between send_req()).
         std::lock_guard<std::mutex> l(rpc_protector_);
         rpc_.reset();
+        rpc_read_index_pool_.clear();
     }
     hb_task_.reset();
 }

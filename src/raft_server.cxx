@@ -867,7 +867,7 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
     p_tr("src: %d, dst: %d, resp->get_term(): %d\n",
          (int)resp->get_src(), (int)resp->get_dst(), (int)resp->get_term());
 
-    if (resp->get_accepted()) {
+    if (resp->get_accepted() && !resp->is_read_index_probe_only()) {
         // On accepted response, reset response timer.
         auto entry = peers_.find(resp->get_src());
         if (entry != peers_.end()) {
@@ -887,7 +887,11 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
         bool update_term_succ = update_term(resp->get_term());
 
         // if term is updated, no more action is required
-        if (update_term_succ) return;
+        if (update_term_succ) {
+            if (resp->get_type() == msg_type::append_entries_response)
+                notify_read_index_probe_waiters();
+            return;
+        }
     }
 
     // ignore the response that with lower term for safety
@@ -902,12 +906,49 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
         break;
 
     case msg_type::append_entries_response:
-        {
+        if (!resp->is_read_index_probe_only()) {
             cb_func::Param param(id_, leader_, resp->get_src(), resp.get());
             ctx_->cb_func_.call(cb_func::ReceivedAppendEntriesResp, &param);
         }
-        handle_append_entries_resp(*resp);
-        {
+        if (resp->is_read_index_probe_only()) {
+            // This parallel heartbeat proves current leadership, but its
+            // prev-log position may be older than a concurrent replication
+            // response. Never feed it to the replication cursor updater.
+            auto peer_it = peers_.find(resp->get_src());
+            if (resp->get_accepted() && resp->get_term() == state_->get_term() &&
+                peer_it != peers_.end()) {
+                peer_it->second->set_last_ack_term(state_->get_term());
+                peer_it->second->reset_resp_timer();
+            }
+        } else {
+            handle_append_entries_resp(*resp);
+            auto peer_it = peers_.find(resp->get_src());
+            if (role_ == srv_role::leader && peer_it != peers_.end()) {
+                const auto &p = peer_it->second;
+                if (p->get_pending_read_index_probe_generation() >
+                    p->get_last_read_index_probe_generation())
+                    request_append_entries(p);
+            }
+        }
+        // Record the request-correlated probe only after an accepted
+        // AppendEntries response in the current term. This applies both to
+        // the parallel probe channel and to an ordinary replication request
+        // tagged after a read began.
+        if (resp->get_accepted() && resp->get_term() == state_->get_term() &&
+            resp->get_read_index_probe_generation() != 0) {
+            auto peer_it = peers_.find(resp->get_src());
+            if (peer_it != peers_.end())
+                peer_it->second->acknowledge_read_index_probe_generation(
+                    resp->get_read_index_probe_generation());
+        }
+        // The peer's matched index, accepted term, and read-probe generation
+        // have now been updated. Only a response carrying a ReadIndex probe
+        // can satisfy a waiter; ordinary replication responses must not wake
+        // every concurrent strong read to rescan all peers. Higher-term
+        // responses are handled above because they invalidate every proof.
+        if (resp->get_read_index_probe_generation() != 0)
+            notify_read_index_probe_waiters();
+        if (!resp->is_read_index_probe_only()) {
             cb_func::Param param(id_, leader_, resp->get_src(), resp.get());
             ctx_->cb_func_.call(cb_func::AppendEntriesRespHandled, &param);
         }
@@ -1112,6 +1153,14 @@ void raft_server::become_leader() {
     data_fresh_ = true;
 
     request_append_entries();
+
+    // Establish one ReadIndex-only RPC channel to each voter while the
+    // leadership no-op is being replicated. The first strong read can then
+    // use an already connected TCP/TLS socket; this warm-up generation is
+    // older than every subsequent read and cannot satisfy its quorum proof.
+    const uint64_t read_index_warmup_timeout_ms = static_cast<uint64_t>(
+        std::max<int32>(params->heart_beat_interval_ * 10, 1000));
+    request_read_index_probe(read_index_warmup_timeout_ms);
 
     if (my_priority_ == 0 && get_num_voting_members() > 1) {
         // If this member's priority is zero, this node owns a temporary
@@ -1727,14 +1776,32 @@ raft_server::peer_info raft_server::get_peer_info(int32 srv_id) const {
     ret.last_succ_resp_us_ = pp->get_resp_timer_us();
     ret.matched_idx_ = pp->get_matched_idx();
     ret.last_ack_term_ = pp->get_last_ack_term();
+    ret.last_read_index_probe_generation_ =
+        pp->get_last_read_index_probe_generation();
+    ret.is_voter_ = !pp->is_learner() && !pp->is_new_joiner() &&
+                    (!srv_to_leave_ || srv_to_leave_->get_id() != pp->get_id());
     return ret;
 }
 
-std::vector<raft_server::peer_info> raft_server::get_peer_info_all() const {
+std::vector<raft_server::peer_info> raft_server::get_peer_info_all(
+    ulong* config_log_index_out) const {
     std::vector<raft_server::peer_info> ret;
-    if (!is_leader()) return ret;
+    get_peer_info_all(ret, config_log_index_out);
+    return ret;
+}
 
+void raft_server::get_peer_info_all(
+    std::vector<peer_info>& peers_out,
+    ulong* config_log_index_out) const {
+    peers_out.clear();
     recur_lock(lock_);
+    if (config_log_index_out) *config_log_index_out = 0;
+    if (role_ != srv_role::leader) return;
+
+    const auto config = get_config();
+    if (config_log_index_out && config)
+        *config_log_index_out = config->get_log_idx();
+
     for (auto entry: peers_) {
         peer_info pi;
         ptr<peer> pp = entry.second;
@@ -1743,9 +1810,41 @@ std::vector<raft_server::peer_info> raft_server::get_peer_info_all() const {
         pi.last_succ_resp_us_ = pp->get_resp_timer_us();
         pi.matched_idx_ = pp->get_matched_idx();
         pi.last_ack_term_ = pp->get_last_ack_term();
-        ret.push_back(pi);
+        pi.last_read_index_probe_generation_ =
+            pp->get_last_read_index_probe_generation();
+        pi.is_voter_ = !pp->is_learner() && !pp->is_new_joiner() &&
+                       (!srv_to_leave_ ||
+                        srv_to_leave_->get_id() != pp->get_id());
+        peers_out.push_back(pi);
     }
-    return ret;
+}
+
+uint64_t raft_server::get_read_index_rpc_pool_saturation_count() const {
+    uint64_t total = 0;
+    recur_lock(lock_);
+    for (const auto &entry : peers_)
+        total += entry.second->read_index_rpc_pool_saturations();
+    return total;
+}
+
+void raft_server::wait_for_read_index_probe_event(
+    uint64_t observed_sequence,
+    std::chrono::steady_clock::time_point deadline) const {
+    std::unique_lock<std::mutex> lock(read_index_probe_wait_mutex_);
+    read_index_probe_wait_cv_.wait_until(
+        lock, deadline, [this, observed_sequence] {
+            return read_index_probe_event_sequence_.load(
+                       std::memory_order_acquire) != observed_sequence;
+        });
+}
+
+void raft_server::notify_read_index_probe_waiters() {
+    {
+        std::lock_guard<std::mutex> lock(read_index_probe_wait_mutex_);
+        read_index_probe_event_sequence_.fetch_add(1,
+                                                   std::memory_order_release);
+    }
+    read_index_probe_wait_cv_.notify_all();
 }
 
 ptr<cluster_config> raft_server::get_config() const {
