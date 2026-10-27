@@ -1778,6 +1778,7 @@ raft_server::peer_info raft_server::get_peer_info(int32 srv_id) const {
     ret.last_ack_term_ = pp->get_last_ack_term();
     ret.last_read_index_probe_generation_ =
         pp->get_last_read_index_probe_generation();
+    ret.read_index_timing_ = pp->get_read_index_rpc_timing_snapshot();
     ret.is_voter_ = !pp->is_learner() && !pp->is_new_joiner() &&
                     (!srv_to_leave_ || srv_to_leave_->get_id() != pp->get_id());
     return ret;
@@ -1812,6 +1813,7 @@ void raft_server::get_peer_info_all(
         pi.last_ack_term_ = pp->get_last_ack_term();
         pi.last_read_index_probe_generation_ =
             pp->get_last_read_index_probe_generation();
+        pi.read_index_timing_ = pp->get_read_index_rpc_timing_snapshot();
         pi.is_voter_ = !pp->is_learner() && !pp->is_new_joiner() &&
                        (!srv_to_leave_ ||
                         srv_to_leave_->get_id() != pp->get_id());

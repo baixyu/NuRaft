@@ -24,6 +24,8 @@ limitations under the License.
 #include "raft_server.hxx"
 #include "tracer.hxx"
 
+#include <algorithm>
+#include <chrono>
 #include <unordered_set>
 
 namespace nuraft {
@@ -33,7 +35,8 @@ bool peer::send_req( ptr<peer> myself,
                      rpc_handler& handler,
                      bool streaming,
                      bool read_index_channel,
-                     uint64_t send_timeout_ms )
+                     uint64_t send_timeout_ms,
+                     bool read_index_timing )
 {
     if (abandoned_) {
         p_er("peer %d has been shut down, cannot send request",
@@ -106,6 +109,15 @@ bool peer::send_req( ptr<peer> myself,
         }
     }
 
+    // The flag is passed by raft_server and is normally false. Only requests
+    // carrying a ReadIndex generation pay for the clock read.
+    const bool capture_read_index_timing =
+        read_index_timing && req &&
+        req->get_read_index_probe_generation() != 0;
+    const auto sent_at = capture_read_index_timing
+                             ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+
     rpc_handler h = (rpc_handler)std::bind
                     ( &peer::handle_rpc_result,
                       this,
@@ -117,6 +129,8 @@ bool peer::send_req( ptr<peer> myself,
                       streaming,
                       read_index_channel,
                       req_size_bytes,
+                      capture_read_index_timing,
+                      sent_at,
                       std::placeholders::_1,
                       std::placeholders::_2 );
     if (rpc_local) {
@@ -141,9 +155,25 @@ void peer::handle_rpc_result( ptr<peer> myself,
                               bool streaming,
                               bool read_index_channel,
                               size_t req_size_bytes,
+                              bool read_index_timing,
+                              std::chrono::steady_clock::time_point sent_at,
                               ptr<resp_msg>& resp,
                               ptr<rpc_exception>& err )
 {
+    if (read_index_timing) {
+        const uint64_t elapsed_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - sent_at)
+                .count());
+        const uint64_t generation =
+            req ? req->get_read_index_probe_generation() : 0;
+        const uint64_t term = req ? req->get_term() : 0;
+        const bool accepted = resp && resp->get_accepted() &&
+                              resp->get_term() == term;
+        const uint64_t outcome = err != nilptr ? 3 : (accepted ? 1 : 2);
+        record_read_index_rpc_result(generation, term, outcome, elapsed_us);
+    }
+
     if (abandoned_) {
         p_in("peer %d has been shut down, ignore response.", config_->get_id());
         return;
@@ -295,6 +325,96 @@ void peer::handle_rpc_result( ptr<peer> myself,
             }
         }
     }
+}
+
+void peer::record_read_index_rpc_result(uint64_t generation,
+                                        uint64_t term,
+                                        uint64_t outcome,
+                                        uint64_t elapsed_us) {
+    read_index_rpc_callbacks_.fetch_add(1, std::memory_order_relaxed);
+    read_index_rpc_callback_generation_.store(generation,
+                                               std::memory_order_relaxed);
+    read_index_rpc_callback_term_.store(term, std::memory_order_relaxed);
+    read_index_rpc_callback_outcome_.store(outcome,
+                                           std::memory_order_relaxed);
+    read_index_rpc_rtt_samples_.fetch_add(1, std::memory_order_relaxed);
+    read_index_rpc_rtt_sum_us_.fetch_add(elapsed_us,
+                                         std::memory_order_relaxed);
+    read_index_rpc_rtt_last_us_.store(elapsed_us, std::memory_order_relaxed);
+    auto update_max = [elapsed_us](std::atomic<uint64_t> &maximum) {
+        uint64_t previous = maximum.load(std::memory_order_relaxed);
+        while (elapsed_us > previous &&
+               !maximum.compare_exchange_weak(previous, elapsed_us,
+                                              std::memory_order_relaxed)) {
+        }
+    };
+    update_max(read_index_rpc_rtt_max_us_);
+
+    if (outcome == 1) {
+        read_index_rpc_accepted_.fetch_add(1, std::memory_order_relaxed);
+        read_index_rpc_accepted_rtt_samples_.fetch_add(
+            1, std::memory_order_relaxed);
+        read_index_rpc_accepted_rtt_sum_us_.fetch_add(
+            elapsed_us, std::memory_order_relaxed);
+        read_index_rpc_accepted_rtt_last_us_.store(
+            elapsed_us, std::memory_order_relaxed);
+        update_max(read_index_rpc_accepted_rtt_max_us_);
+        static constexpr uint64_t limits[] = {
+            100, 250, 500, 1000, 2000, 3000, 4000, 5000, 10000};
+        size_t bucket = 0;
+        while (bucket < 9 && elapsed_us > limits[bucket])
+            ++bucket;
+        read_index_rpc_accepted_rtt_buckets_[bucket].fetch_add(
+            1, std::memory_order_relaxed);
+    } else if (outcome == 2) {
+        read_index_rpc_rejected_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        read_index_rpc_errors_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+read_index_rpc_timing_snapshot peer::get_read_index_rpc_timing_snapshot()
+    const {
+    read_index_rpc_timing_snapshot snapshot;
+    snapshot.pending_generation = pending_read_index_probe_generation_;
+    snapshot.attempted_generation = last_read_index_probe_attempted_generation_;
+    snapshot.callback_generation = read_index_rpc_callback_generation_.load(
+        std::memory_order_relaxed);
+    snapshot.callback_term = read_index_rpc_callback_term_.load(
+        std::memory_order_relaxed);
+    snapshot.callback_outcome = read_index_rpc_callback_outcome_.load(
+        std::memory_order_relaxed);
+    snapshot.callbacks = read_index_rpc_callbacks_.load(
+        std::memory_order_relaxed);
+    snapshot.accepted = read_index_rpc_accepted_.load(
+        std::memory_order_relaxed);
+    snapshot.rejected = read_index_rpc_rejected_.load(
+        std::memory_order_relaxed);
+    snapshot.errors = read_index_rpc_errors_.load(
+        std::memory_order_relaxed);
+    snapshot.dispatch_failures = read_index_dispatch_failures_.load(
+        std::memory_order_relaxed);
+    snapshot.rtt_samples = read_index_rpc_rtt_samples_.load(
+        std::memory_order_relaxed);
+    snapshot.rtt_sum_us = read_index_rpc_rtt_sum_us_.load(
+        std::memory_order_relaxed);
+    snapshot.rtt_last_us = read_index_rpc_rtt_last_us_.load(
+        std::memory_order_relaxed);
+    snapshot.rtt_max_us = read_index_rpc_rtt_max_us_.load(
+        std::memory_order_relaxed);
+    snapshot.accepted_rtt_samples = read_index_rpc_accepted_rtt_samples_.load(
+        std::memory_order_relaxed);
+    snapshot.accepted_rtt_sum_us = read_index_rpc_accepted_rtt_sum_us_.load(
+        std::memory_order_relaxed);
+    snapshot.accepted_rtt_last_us = read_index_rpc_accepted_rtt_last_us_.load(
+        std::memory_order_relaxed);
+    snapshot.accepted_rtt_max_us = read_index_rpc_accepted_rtt_max_us_.load(
+        std::memory_order_relaxed);
+    for (size_t i = 0; i < snapshot.accepted_rtt_buckets.size(); ++i)
+        snapshot.accepted_rtt_buckets[i] =
+            read_index_rpc_accepted_rtt_buckets_[i].load(
+                std::memory_order_relaxed);
+    return snapshot;
 }
 
 void peer::try_set_free(msg_type type, bool streaming) {

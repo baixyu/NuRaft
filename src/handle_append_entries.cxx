@@ -411,7 +411,13 @@ bool raft_server::send_request(ptr<peer>& p,
         p->reset_manual_free();
     }
 
-    p->send_req(p, msg, m_handler, streaming);
+    const bool collect_read_index_timing =
+        read_index_timing_enabled_.load(std::memory_order_relaxed);
+    if (!p->send_req(p, msg, m_handler, streaming, false, 0,
+                     collect_read_index_timing) &&
+        collect_read_index_timing && msg &&
+        msg->get_read_index_probe_generation() != 0)
+        p->record_read_index_dispatch_failure();
     p->reset_ls_timer();
 
     cb_func::Param param(id_, leader_, p->get_id(), msg.get());

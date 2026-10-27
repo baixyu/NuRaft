@@ -26,11 +26,13 @@ limitations under the License.
 #include "internal_timer.hxx"
 #include "timer_task.hxx"
 #include "rpc_cli_factory.hxx"
+#include "read_index_timing.hxx"
 #include "snapshot_sync_ctx.hxx"
 #include "srv_config.hxx"
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <vector>
 
 namespace nuraft {
@@ -207,6 +209,10 @@ public:
         return last_read_index_probe_generation_;
     }
 
+    uint64_t get_last_read_index_probe_attempted_generation() const {
+        return last_read_index_probe_attempted_generation_;
+    }
+
     void set_pending_read_index_probe_generation(uint64_t generation) {
         if (generation > pending_read_index_probe_generation_)
             pending_read_index_probe_generation_ = generation;
@@ -241,6 +247,16 @@ public:
         return read_index_rpc_pool_saturations_.load(
             std::memory_order_relaxed);
     }
+
+    void record_read_index_dispatch_failure() {
+        read_index_dispatch_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void record_read_index_rpc_result(
+        uint64_t generation, uint64_t term, uint64_t outcome,
+        uint64_t elapsed_us);
+
+    read_index_rpc_timing_snapshot get_read_index_rpc_timing_snapshot() const;
 
     void set_pending_commit() {
         pending_commit_flag_.store(true);
@@ -285,7 +301,8 @@ public:
                   rpc_handler& handler,
                   bool streaming = false,
                   bool read_index_channel = false,
-                  uint64_t send_timeout_ms = 0);
+                  uint64_t send_timeout_ms = 0,
+                  bool read_index_timing = false);
 
     void shutdown();
 
@@ -419,6 +436,8 @@ private:
                            bool streaming,
                            bool read_index_channel,
                            size_t req_size_bytes,
+                           bool read_index_timing,
+                           std::chrono::steady_clock::time_point sent_at,
                            ptr<resp_msg>& resp,
                            ptr<rpc_exception>& err);
 
@@ -453,6 +472,23 @@ private:
     static constexpr size_t max_read_index_rpc_slots_ = 256;
     std::vector<read_index_rpc_slot> rpc_read_index_pool_;
     std::atomic<uint64_t> read_index_rpc_pool_saturations_{0};
+    std::atomic<uint64_t> read_index_dispatch_failures_{0};
+    std::atomic<uint64_t> read_index_rpc_callbacks_{0};
+    std::atomic<uint64_t> read_index_rpc_accepted_{0};
+    std::atomic<uint64_t> read_index_rpc_rejected_{0};
+    std::atomic<uint64_t> read_index_rpc_errors_{0};
+    std::atomic<uint64_t> read_index_rpc_callback_generation_{0};
+    std::atomic<uint64_t> read_index_rpc_callback_term_{0};
+    std::atomic<uint64_t> read_index_rpc_callback_outcome_{0};
+    std::atomic<uint64_t> read_index_rpc_rtt_samples_{0};
+    std::atomic<uint64_t> read_index_rpc_rtt_sum_us_{0};
+    std::atomic<uint64_t> read_index_rpc_rtt_last_us_{0};
+    std::atomic<uint64_t> read_index_rpc_rtt_max_us_{0};
+    std::atomic<uint64_t> read_index_rpc_accepted_rtt_samples_{0};
+    std::atomic<uint64_t> read_index_rpc_accepted_rtt_sum_us_{0};
+    std::atomic<uint64_t> read_index_rpc_accepted_rtt_last_us_{0};
+    std::atomic<uint64_t> read_index_rpc_accepted_rtt_max_us_{0};
+    std::array<std::atomic<uint64_t>, 10> read_index_rpc_accepted_rtt_buckets_{};
 
     /** Guards `rpc_` and the ReadIndex RPC pool. */
     std::mutex rpc_protector_;

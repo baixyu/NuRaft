@@ -147,11 +147,14 @@ ptr<req_msg> raft_server::create_read_index_probe_req(
 void raft_server::dispatch_pending_read_index_probe(ptr<peer>& p,
                                                    uint64_t timeout_ms) {
     if (role_ != srv_role::leader) return;
+    const bool collect_timing =
+        read_index_timing_enabled_.load(std::memory_order_relaxed);
     const uint64_t generation = p->begin_read_index_probe();
     if (generation == 0) return;
 
     ptr<req_msg> request = create_read_index_probe_req(p, generation);
     if (request == nullptr) {
+        if (collect_timing) p->record_read_index_dispatch_failure();
         p->complete_read_index_probe(generation);
         return;
     }
@@ -159,6 +162,7 @@ void raft_server::dispatch_pending_read_index_probe(ptr<peer>& p,
     cb_func::Param request_param(id_, leader_, p->get_id(), request.get());
     if (ctx_->cb_func_.call(cb_func::RequestAppendEntries, &request_param) ==
         CbReturnCode::ReturnNull) {
+        if (collect_timing) p->record_read_index_dispatch_failure();
         p->complete_read_index_probe(generation);
         return;
     }
@@ -169,7 +173,9 @@ void raft_server::dispatch_pending_read_index_probe(ptr<peer>& p,
         handle_read_index_probe_resp(p, generation, response, error);
     };
     if (!p->send_req(p, request, handler, true, true,
-                     std::max<std::uint64_t>(timeout_ms, 1))) {
+                     std::max<std::uint64_t>(timeout_ms, 1),
+                     collect_timing)) {
+        if (collect_timing) p->record_read_index_dispatch_failure();
         p->complete_read_index_probe(generation);
         return;
     }

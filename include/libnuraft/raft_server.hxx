@@ -25,6 +25,7 @@ limitations under the License.
 #include "callback.hxx"
 #include "internal_timer.hxx"
 #include "log_store.hxx"
+#include "read_index_timing.hxx"
 #include "snapshot_sync_req.hxx"
 #include "rpc_cli.hxx"
 #include "srv_config.hxx"
@@ -296,6 +297,11 @@ public:
      */
     uint64_t read_index_probe_event_sequence() const {
         return read_index_probe_event_sequence_.load(std::memory_order_acquire);
+    }
+
+    /** Enable optional per-peer timings for requests carrying ReadIndex generations. */
+    void set_read_index_timing_enabled(bool enabled) {
+        read_index_timing_enabled_.store(enabled, std::memory_order_relaxed);
     }
 
     /**
@@ -668,6 +674,7 @@ public:
             , matched_idx_(0)
             , last_ack_term_(0)
             , last_read_index_probe_generation_(0)
+            , read_index_timing_()
             , is_voter_(false)
             {}
 
@@ -706,6 +713,9 @@ public:
 
         /** Latest locally correlated ReadIndex AppendEntries response. */
         uint64_t last_read_index_probe_generation_;
+
+        /** Per-peer request generation and RTT details, enabled by timing option. */
+        read_index_rpc_timing_snapshot read_index_timing_;
 
         /** Whether this peer participates in the current leader quorum. */
         bool is_voter_;
@@ -1615,6 +1625,7 @@ protected:
     mutable std::mutex read_index_probe_wait_mutex_;
     mutable std::condition_variable read_index_probe_wait_cv_;
     std::atomic<uint64_t> read_index_probe_event_sequence_{0};
+    std::atomic<bool> read_index_timing_enabled_{false};
 
     /**
      * Lock of handling client request and role change.
