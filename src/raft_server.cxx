@@ -41,12 +41,77 @@ limitations under the License.
 #include <random>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 namespace nuraft {
 
 const int raft_server::default_snapshot_sync_block_size = 4 * 1024;
 
 raft_server::limits raft_server::raft_limits_;
+
+read_index_probe_tracker::read_index_probe_tracker(
+    ulong term, uint64_t generation,
+    std::vector<read_index_probe_member_state> members,
+    uint32_t voter_count)
+    : term_(term),
+      generation_(generation),
+      voter_count_(voter_count),
+      members_(std::move(members)) {
+    for (size_t i = 0; i < members_.size(); ++i)
+        member_positions_.emplace(members_[i].id_, i);
+    quorum_signaled_ = has_quorum();
+}
+
+uint64_t read_index_probe_tracker::event_sequence() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return event_sequence_;
+}
+
+bool read_index_probe_tracker::has_quorum() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return fresh_ack_voters_ >= voter_count_ / 2 + 1;
+}
+
+void read_index_probe_tracker::wait_for_change(
+    uint64_t observed_sequence,
+    std::chrono::steady_clock::time_point deadline) const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_until(lock, deadline, [this, observed_sequence] {
+        return event_sequence_ != observed_sequence;
+    });
+}
+
+void read_index_probe_tracker::acknowledge(int32 member_id, ulong term,
+                                           uint64_t generation) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (term != term_ || generation < generation_) return;
+    const auto position = member_positions_.find(member_id);
+    if (position == member_positions_.end()) return;
+    auto& member = members_[position->second];
+    if (!member.is_voter_ ||
+        (member.last_ack_term_ == term_ &&
+         member.last_read_index_probe_generation_ >= generation))
+        return;
+
+    const bool was_fresh = member.last_ack_term_ == term_ &&
+                           member.last_read_index_probe_generation_ >=
+                               generation_;
+    member.last_ack_term_ = term_;
+    member.last_read_index_probe_generation_ = generation;
+    if (!was_fresh) ++fresh_ack_voters_;
+    const bool quorum_now = fresh_ack_voters_ >= voter_count_ / 2 + 1;
+    if (quorum_now && !quorum_signaled_) {
+        quorum_signaled_ = true;
+        ++event_sequence_;
+        cv_.notify_all();
+    }
+}
+
+void read_index_probe_tracker::signal_term_change() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    ++event_sequence_;
+    cv_.notify_all();
+}
 
 raft_server::raft_server(context* ctx, const init_options& opt)
     : bg_append_ea_(nullptr)
@@ -814,6 +879,11 @@ void raft_server::reset_peer_info() {
 
 void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+    handle_peer_resp_locked(resp, err);
+}
+
+void raft_server::handle_peer_resp_locked(ptr<resp_msg>& resp,
+                                          ptr<rpc_exception>& err) {
     if (err) {
         int32 peer_id = err->req()->get_dst();
         ptr<peer> pp = nullptr;
@@ -889,7 +959,7 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
         // if term is updated, no more action is required
         if (update_term_succ) {
             if (resp->get_type() == msg_type::append_entries_response)
-                notify_read_index_probe_waiters();
+                signal_read_index_probe_trackers();
             return;
         }
     }
@@ -935,23 +1005,19 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
         // AppendEntries response in the current term. This applies both to
         // the parallel probe channel and to an ordinary replication request
         // tagged after a read began.
-        bool read_index_acknowledged = false;
         if (resp->get_accepted() && resp->get_term() == state_->get_term() &&
             resp->get_read_index_probe_generation() != 0) {
             auto peer_it = peers_.find(resp->get_src());
             if (peer_it != peers_.end()) {
                 peer_it->second->acknowledge_read_index_probe_generation(
                     resp->get_read_index_probe_generation());
-                read_index_acknowledged = true;
+                record_read_index_probe_ack(
+                    resp->get_src(), state_->get_term(),
+                    resp->get_read_index_probe_generation());
             }
         }
-        // The peer's matched index, accepted term, and read-probe generation
-        // have now been updated. Only a response carrying a ReadIndex probe
-        // can satisfy a waiter; rejected responses do not change usable quorum
-        // evidence and need not wake every concurrent strong read. Higher-term
-        // responses are handled above because they invalidate every proof.
-        if (read_index_acknowledged)
-            notify_read_index_probe_waiters();
+        // Only responses that advance the current round to quorum wake its
+        // coordinator. Rejected responses and minority acks need no wakeup.
         if (!resp->is_read_index_probe_only()) {
             cb_func::Param param(id_, leader_, resp->get_src(), resp.get());
             ctx_->cb_func_.call(cb_func::AppendEntriesRespHandled, &param);
@@ -1844,24 +1910,29 @@ uint64_t raft_server::get_read_index_rpc_pool_saturation_count() const {
     return total;
 }
 
-void raft_server::wait_for_read_index_probe_event(
-    uint64_t observed_sequence,
-    std::chrono::steady_clock::time_point deadline) const {
-    std::unique_lock<std::mutex> lock(read_index_probe_wait_mutex_);
-    read_index_probe_wait_cv_.wait_until(
-        lock, deadline, [this, observed_sequence] {
-            return read_index_probe_event_sequence_.load(
-                       std::memory_order_acquire) != observed_sequence;
-        });
+void raft_server::record_read_index_probe_ack(int32 member_id, ulong term,
+                                             uint64_t generation) {
+    for (auto it = read_index_probe_trackers_.begin();
+         it != read_index_probe_trackers_.end();) {
+        if (auto tracker = it->lock()) {
+            tracker->acknowledge(member_id, term, generation);
+            ++it;
+        } else {
+            it = read_index_probe_trackers_.erase(it);
+        }
+    }
 }
 
-void raft_server::notify_read_index_probe_waiters() {
-    {
-        std::lock_guard<std::mutex> lock(read_index_probe_wait_mutex_);
-        read_index_probe_event_sequence_.fetch_add(1,
-                                                   std::memory_order_release);
+void raft_server::signal_read_index_probe_trackers() {
+    for (auto it = read_index_probe_trackers_.begin();
+         it != read_index_probe_trackers_.end();) {
+        if (auto tracker = it->lock()) {
+            tracker->signal_term_change();
+            ++it;
+        } else {
+            it = read_index_probe_trackers_.erase(it);
+        }
     }
-    read_index_probe_wait_cv_.notify_all();
 }
 
 ptr<cluster_config> raft_server::get_config() const {

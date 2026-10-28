@@ -38,10 +38,12 @@ limitations under the License.
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace nuraft {
 
@@ -58,6 +60,47 @@ class rpc_client;
 class raft_server_handler;
 class req_msg;
 class resp_msg;
+
+/** A member's immutable voter role and latest accepted ReadIndex probe ack. */
+struct read_index_probe_member_state {
+    int32 id_;
+    bool is_voter_;
+    ulong last_ack_term_;
+    uint64_t last_read_index_probe_generation_;
+};
+
+/** Per-round ack tracker. It lets ReadIndex wait without rescanning peers under
+ * the raft_server global lock after every response. */
+class read_index_probe_tracker {
+public:
+    read_index_probe_tracker(
+        ulong term, uint64_t generation,
+        std::vector<read_index_probe_member_state> members,
+        uint32_t voter_count);
+
+    uint64_t event_sequence() const;
+    bool has_quorum() const;
+    void wait_for_change(
+        uint64_t observed_sequence,
+        std::chrono::steady_clock::time_point deadline) const;
+
+private:
+    friend class raft_server;
+
+    void acknowledge(int32 member_id, ulong term, uint64_t generation);
+    void signal_term_change();
+
+    const ulong term_;
+    const uint64_t generation_;
+    const uint32_t voter_count_;
+    uint32_t fresh_ack_voters_{1}; // The local leader is a voter.
+    bool quorum_signaled_{false};
+    std::vector<read_index_probe_member_state> members_;
+    std::unordered_map<int32, size_t> member_positions_;
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    uint64_t event_sequence_{0};
+};
 class rpc_exception;
 class snapshot_sync_ctx;
 class state_machine;
@@ -124,6 +167,7 @@ public:
         ulong safe_read_index_{0};
         ulong config_log_index_{0};
         uint64_t generation_{0};
+        ptr<read_index_probe_tracker> tracker_;
     };
 
     struct limits {
@@ -290,30 +334,10 @@ public:
      */
     read_index_probe_result request_read_index_probe(uint64_t timeout_ms);
 
-    /**
-     * Return the current response-event sequence for ReadIndex waiters.
-     * The sequence advances when an accepted, current-term ReadIndex-tagged
-     * AppendEntries response adds a usable acknowledgement, or when a response
-     * advances the term, so callers can recheck quorum state and leadership
-     * without polling.
-     */
-    uint64_t read_index_probe_event_sequence() const {
-        return read_index_probe_event_sequence_.load(std::memory_order_acquire);
-    }
-
     /** Enable optional per-peer timings for requests carrying ReadIndex generations. */
     void set_read_index_timing_enabled(bool enabled) {
         read_index_timing_enabled_.store(enabled, std::memory_order_relaxed);
     }
-
-    /**
-     * Wait until a peer response changes the ReadIndex event sequence or the
-     * deadline expires. Callers must inspect state before and after waiting;
-     * this is only a wakeup mechanism, not a quorum proof.
-     */
-    void wait_for_read_index_probe_event(
-        uint64_t observed_sequence,
-        std::chrono::steady_clock::time_point deadline) const;
 
     /**
      * Flip learner flag of given server.
@@ -1042,10 +1066,13 @@ protected:
     bool check_leadership_validity();
     void check_leadership_transfer();
     void update_rand_timeout();
-    void notify_read_index_probe_waiters();
     void cancel_global_requests();
 
     bool is_regular_member(const ptr<peer>& p);
+    void handle_peer_resp_locked(ptr<resp_msg>& resp, ptr<rpc_exception>& err);
+    void record_read_index_probe_ack(int32 member_id, ulong term,
+                                     uint64_t generation);
+    void signal_read_index_probe_trackers();
     int32 get_num_voting_members();
     int32 get_quorum_for_election();
     int32 get_quorum_for_commit();
@@ -1628,10 +1655,9 @@ protected:
      */
     mutable std::recursive_mutex lock_;
 
-    /** ReadIndex waiters sleep here; notifications never acquire `lock_`. */
-    mutable std::mutex read_index_probe_wait_mutex_;
-    mutable std::condition_variable read_index_probe_wait_cv_;
-    std::atomic<uint64_t> read_index_probe_event_sequence_{0};
+    /** Active ReadIndex rounds are weakly held and updated under `lock_`. */
+    std::vector<std::weak_ptr<read_index_probe_tracker>>
+        read_index_probe_trackers_;
     std::atomic<bool> read_index_timing_enabled_{false};
 
     /**

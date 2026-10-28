@@ -34,6 +34,7 @@ limitations under the License.
 #include <cassert>
 #include <chrono>
 #include <sstream>
+#include <utility>
 
 namespace nuraft {
 
@@ -118,6 +119,31 @@ raft_server::read_index_probe_result raft_server::request_read_index_probe(
 
         uint64_t generation = ++next_read_index_probe_generation_;
         if (generation == 0) generation = ++next_read_index_probe_generation_;
+
+        // Freeze the voting membership for this round and keep only the ack
+        // fields that ReadIndex needs. Responses update this tracker as they
+        // are processed, so the waiter does not need to rescan peers_ under
+        // lock_ after every wakeup.
+        std::vector<read_index_probe_member_state> members;
+        members.reserve(peers_.size());
+        uint32_t voter_count = 1; // The local member was checked above.
+        for (const auto& entry : peers_) {
+            const auto& p = entry.second;
+            const bool is_voter = is_regular_member(p);
+            if (is_voter) ++voter_count;
+            members.push_back({p->get_id(), is_voter, 0, 0});
+        }
+        auto tracker = cs_new<read_index_probe_tracker>(
+            result.term_, generation, std::move(members), voter_count);
+        for (auto it = read_index_probe_trackers_.begin();
+             it != read_index_probe_trackers_.end();) {
+            if (it->expired())
+                it = read_index_probe_trackers_.erase(it);
+            else
+                ++it;
+        }
+        read_index_probe_trackers_.push_back(tracker);
+        result.tracker_ = tracker;
 
         dispatches.reserve(peers_.size());
         const ulong first_retained_idx = log_store_->start_index();
@@ -207,8 +233,18 @@ void raft_server::handle_read_index_probe_resp(
     ptr<peer> p, uint64_t generation, ptr<resp_msg>& response,
     ptr<rpc_exception>& error) {
     if (response) {
-        handle_peer_resp(response, error);
-    } else if (error) {
+        // Process the response and clear its pending generation in one
+        // global-lock acquisition. The ordinary response entry point takes
+        // this same lock for non-probe RPCs.
+        recur_lock(lock_);
+        handle_peer_resp_locked(response, error);
+        auto it = peers_.find(p->get_id());
+        if (it != peers_.end() && it->second == p)
+            p->complete_read_index_probe(generation);
+        return;
+    }
+
+    if (error) {
         // A probe-channel failure must not mark the replication channel's
         // peer as lost. The read will fail quorum confirmation and use the
         // normal barrier fallback; a later probe recreates this socket.
