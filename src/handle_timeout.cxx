@@ -337,6 +337,9 @@ void raft_server::cancel_schedulers() {
     if (election_task_) {
         cancel_task(election_task_);
     }
+    if (read_index_warmup_task_) {
+        cancel_task(read_index_warmup_task_);
+    }
 
     for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
         const ptr<peer>& p = it->second;

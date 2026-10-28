@@ -283,17 +283,19 @@ public:
      * the leader-local generation attached to requests sent after this call.
      * No log entry is appended. Each peer uses a separate RPC channel for its
      * empty probe, so log replication in flight cannot delay the quorum round.
-     * At most one probe is in flight per peer; newer read generations share
-     * the next probe. The result captures the exact term, configuration, and
-     * read index and refuses to start when this node is not a voter.
+     * Each request is correlated with its own generation; concurrent calls can
+     * have overlapping probes. The result captures the exact term,
+     * configuration, and read index and refuses to start when this node is not
+     * a voter.
      */
     read_index_probe_result request_read_index_probe(uint64_t timeout_ms);
 
     /**
      * Return the current response-event sequence for ReadIndex waiters.
-     * The sequence advances when a ReadIndex-tagged AppendEntries response
-     * arrives (accepted or rejected), or when a response advances the term,
-     * so callers can recheck quorum state and leadership without polling.
+     * The sequence advances when an accepted, current-term ReadIndex-tagged
+     * AppendEntries response adds a usable acknowledgement, or when a response
+     * advances the term, so callers can recheck quorum state and leadership
+     * without polling.
      */
     uint64_t read_index_probe_event_sequence() const {
         return read_index_probe_event_sequence_.load(std::memory_order_acquire);
@@ -1109,9 +1111,11 @@ protected:
     void handle_join_leave_rpc_err(msg_type t_msg, ptr<peer> p);
     void reset_srv_to_join();
     void reset_srv_to_leave();
-    ptr<req_msg> create_read_index_probe_req(ptr<peer>& p,
-                                             uint64_t generation);
-    void dispatch_pending_read_index_probe(ptr<peer>& p, uint64_t timeout_ms);
+    void dispatch_read_index_probe(ptr<peer> p, uint64_t generation,
+                                   ptr<req_msg> request,
+                                   uint64_t timeout_ms,
+                                   int32_t leader_id,
+                                   bool collect_timing);
     void handle_read_index_probe_resp(ptr<peer> p, uint64_t generation,
                                       ptr<resp_msg>& resp,
                                       ptr<rpc_exception>& err);
@@ -1463,6 +1467,9 @@ protected:
      * Election timer.
      */
     ptr<delayed_task> election_task_;
+
+    /** ReadIndex RPC warm-up, dispatched after the current Raft lock is released. */
+    ptr<delayed_task> read_index_warmup_task_;
 
     /**
      * The time when the election timer was reset last time.

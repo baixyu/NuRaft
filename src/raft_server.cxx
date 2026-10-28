@@ -906,6 +906,7 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
         break;
 
     case msg_type::append_entries_response:
+    {
         if (!resp->is_read_index_probe_only()) {
             cb_func::Param param(id_, leader_, resp->get_src(), resp.get());
             ctx_->cb_func_.call(cb_func::ReceivedAppendEntriesResp, &param);
@@ -934,25 +935,29 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
         // AppendEntries response in the current term. This applies both to
         // the parallel probe channel and to an ordinary replication request
         // tagged after a read began.
+        bool read_index_acknowledged = false;
         if (resp->get_accepted() && resp->get_term() == state_->get_term() &&
             resp->get_read_index_probe_generation() != 0) {
             auto peer_it = peers_.find(resp->get_src());
-            if (peer_it != peers_.end())
+            if (peer_it != peers_.end()) {
                 peer_it->second->acknowledge_read_index_probe_generation(
                     resp->get_read_index_probe_generation());
+                read_index_acknowledged = true;
+            }
         }
         // The peer's matched index, accepted term, and read-probe generation
         // have now been updated. Only a response carrying a ReadIndex probe
-        // can satisfy a waiter; ordinary replication responses must not wake
-        // every concurrent strong read to rescan all peers. Higher-term
+        // can satisfy a waiter; rejected responses do not change usable quorum
+        // evidence and need not wake every concurrent strong read. Higher-term
         // responses are handled above because they invalidate every proof.
-        if (resp->get_read_index_probe_generation() != 0)
+        if (read_index_acknowledged)
             notify_read_index_probe_waiters();
         if (!resp->is_read_index_probe_only()) {
             cb_func::Param param(id_, leader_, resp->get_src(), resp.get());
             ctx_->cb_func_.call(cb_func::AppendEntriesRespHandled, &param);
         }
         break;
+    }
 
     case msg_type::install_snapshot_response:
         handle_install_snapshot_resp(*resp);
@@ -1158,9 +1163,19 @@ void raft_server::become_leader() {
     // leadership no-op is being replicated. The first strong read can then
     // use an already connected TCP/TLS socket; this warm-up generation is
     // older than every subsequent read and cannot satisfy its quorum proof.
+    // become_leader() runs under lock_, so defer the warm-up to the scheduler;
+    // request_read_index_probe() can then release lock_ before starting RPCs.
     const uint64_t read_index_warmup_timeout_ms = static_cast<uint64_t>(
         std::max<int32>(params->heart_beat_interval_ * 10, 1000));
-    request_read_index_probe(read_index_warmup_timeout_ms);
+    if (read_index_warmup_task_) {
+        cancel_task(read_index_warmup_task_);
+    }
+    timer_task<void>::executor warmup_exec =
+        [this, read_index_warmup_timeout_ms]() {
+            request_read_index_probe(read_index_warmup_timeout_ms);
+        };
+    read_index_warmup_task_ = cs_new<timer_task<void>>(warmup_exec);
+    schedule_task(read_index_warmup_task_, 0);
 
     if (my_priority_ == 0 && get_num_voting_members() > 1) {
         // If this member's priority is zero, this node owns a temporary
