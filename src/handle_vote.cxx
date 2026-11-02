@@ -45,6 +45,24 @@ bool raft_server::check_cond_for_zp_election() {
     return false;
 }
 
+bool raft_server::election_initiation_withheld(bool pre_vote) {
+    cb_func::ElectionInitiationArgs args{state_->get_term(),
+                                         log_store_->next_slot() - 1,
+                                         quick_commit_index_.load(),
+                                         pre_vote};
+    cb_func::Param param(id_, leader_);
+    param.ctx = &args;
+    if ( ctx_->cb_func_.call(cb_func::ElectionInitiation, &param) !=
+         cb_func::ReturnNull ) {
+        return false;
+    }
+    p_in("[ELECTION] candidacy withheld by callback: %s, term %" PRIu64 ", "
+         "log idx %" PRIu64 ", committed idx %" PRIu64,
+         pre_vote ? "pre-vote" : "vote", args.term, args.last_log_index,
+         args.committed_index);
+    return true;
+}
+
 void raft_server::request_prevote() {
     ptr<raft_params> params = ctx_->get_params();
     ptr<cluster_config> c_config = get_config();
@@ -142,6 +160,11 @@ void raft_server::request_prevote() {
         }
     }
 
+    if ( election_initiation_withheld(true) ) {
+        restart_election_timer();
+        return;
+    }
+
     p_in("[PRE-VOTE INIT] my id %d, my role %s, term %" PRIu64 ", log idx %" PRIu64 ", "
          "log term %" PRIu64 ", priority (target %d / mine %d)\n",
          id_, srv_role_to_string(role_).c_str(),
@@ -197,6 +220,9 @@ void raft_server::request_prevote() {
 }
 
 void raft_server::initiate_vote(bool force_vote) {
+    // Same shape as the grace-period skip below: every caller restarts the
+    // election timer after this returns.
+    if ( !force_vote && election_initiation_withheld(false) ) return;
     int grace_period = ctx_->get_params()->grace_period_of_lagging_state_machine_;
     ulong cur_term = state_->get_term();
     if ( !force_vote &&

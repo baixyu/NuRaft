@@ -257,6 +257,17 @@ public:
          * ctx: pointer to `ulong` (log index).
          */
         StateMachineCommitStarted = 33,
+
+        /**
+         * This member is about to stand for election: it is starting a
+         * pre-vote or a vote of its own because its election timer fired.
+         * Returning `ReturnNull` withholds the candidacy for this round; the
+         * election timer is restarted exactly as for a member whose priority
+         * is below the target.  Not fired for a forced vote (leadership
+         * transfer), which the current Leader asked for explicitly.
+         * ctx: pointer to `ElectionInitiationArgs`.
+         */
+        ElectionInitiation = 34,
     };
 
     struct AppendBatchDurabilityArgs {
@@ -270,6 +281,13 @@ public:
     struct CommitIndexAdvancedArgs {
         uint64_t previous_index;
         uint64_t current_index;
+    };
+
+    struct ElectionInitiationArgs {
+        uint64_t term;
+        uint64_t last_log_index;
+        uint64_t committed_index;
+        bool pre_vote;
     };
 
     struct Param {

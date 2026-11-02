@@ -1115,6 +1115,7 @@ protected:
     bool handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<std::recursive_mutex>& guard);
 
     bool check_cond_for_zp_election();
+    bool election_initiation_withheld(bool pre_vote);
     void request_prevote();
     void initiate_vote(bool force_vote = false);
     void request_vote(bool force_vote);
