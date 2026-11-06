@@ -56,7 +56,18 @@ void raft_server::check_srv_to_leave_timeout() {
 }
 
 void raft_server::handle_hb_timeout(int32 srv_id) {
+    const auto lock_wait_started = std::chrono::steady_clock::now();
     recur_lock(lock_);
+    const auto lock_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lock_wait_started).count());
+    ptr<peer> timing_peer;
+    auto timing_peer_it = peers_.find(srv_id);
+    if (timing_peer_it != peers_.end()) {
+        timing_peer = timing_peer_it->second;
+        timing_peer->record_heartbeat_timer_lock_wait(lock_wait_us);
+    }
+    peer_liveness_lock_hold_scope lock_hold_scope(timing_peer);
 
     check_srv_to_leave_timeout();
 
@@ -203,6 +214,7 @@ void raft_server::dispatch_heartbeat_side_channel(ptr<peer> p) {
         std::max(params->heart_beat_interval_, 1)) * response_limit;
     if (!p->send_req(p, request, handler, false, false, timeout_ms, false,
                      true)) {
+        p->record_heartbeat_side_channel_failed();
         heartbeat_side_channel_failed_.fetch_add(1,
                                                 std::memory_order_relaxed);
         if (p->mark_heartbeat_side_channel_failure_logged())
@@ -229,10 +241,17 @@ void raft_server::handle_heartbeat_side_channel_resp(
         return;
     }
 
+    const auto lock_wait_started = std::chrono::steady_clock::now();
     recur_lock(lock_);
+    const auto lock_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lock_wait_started).count());
+    if (p) p->record_heartbeat_side_channel_lock_wait(lock_wait_us);
+    peer_liveness_lock_hold_scope lock_hold_scope(p);
     const bool accepted_in_current_term =
         response->get_accepted() && response->get_term() == state_->get_term();
     if (!accepted_in_current_term) {
+        if (p) p->record_heartbeat_side_channel_failed();
         heartbeat_side_channel_failed_.fetch_add(1,
                                                 std::memory_order_relaxed);
         if (p && p->mark_heartbeat_side_channel_failure_logged())
@@ -243,15 +262,32 @@ void raft_server::handle_heartbeat_side_channel_resp(
                  p->get_id(), response->get_accepted() ? 1 : 0,
                  response->get_term(), state_->get_term(),
                  response->get_next_idx());
+    } else if (p) {
+        p->record_heartbeat_side_channel_accepted();
+        heartbeat_side_channel_accepted_.fetch_add(
+            1, std::memory_order_relaxed);
     }
     ptr<rpc_exception> no_error;
     handle_peer_resp_locked(response, no_error);
 }
 
-void raft_server::restart_election_timer() {
+void raft_server::restart_election_timer(int32 source_peer_id,
+                                         uint64_t* lock_wait_us_out) {
     // don't start the election timer while this server is still catching up the logs
     // or this server is the leader
+    const auto lock_wait_started = std::chrono::steady_clock::now();
     recur_lock(lock_);
+    const auto lock_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lock_wait_started).count());
+    if (lock_wait_us_out != nullptr) *lock_wait_us_out = lock_wait_us;
+    ptr<peer> source_peer;
+    auto peer_it = peers_.find(source_peer_id);
+    if (source_peer_id >= 0 && peer_it != peers_.end()) {
+        source_peer = peer_it->second;
+        source_peer->record_election_timer_lock_wait(lock_wait_us);
+    }
+    peer_liveness_lock_hold_scope lock_hold_scope(source_peer);
     if (state_->is_catching_up() || role_ == srv_role::leader) {
         return;
     }

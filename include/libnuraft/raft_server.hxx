@@ -339,6 +339,9 @@ public:
     uint64_t heartbeat_side_channel_sent() const {
         return heartbeat_side_channel_sent_.load(std::memory_order_relaxed);
     }
+    uint64_t heartbeat_side_channel_accepted() const {
+        return heartbeat_side_channel_accepted_.load(std::memory_order_relaxed);
+    }
     uint64_t heartbeat_side_channel_failed() const {
         return heartbeat_side_channel_failed_.load(std::memory_order_relaxed);
     }
@@ -507,7 +510,8 @@ public:
      * It will allow the election timer permanently, if it was disabled
      * by state manager.
      */
-    void restart_election_timer();
+    void restart_election_timer(int32 source_peer_id = -1,
+                                uint64_t* lock_wait_us = nullptr);
 
     /**
      * Set custom context to Raft cluster config.
@@ -710,6 +714,7 @@ public:
             , last_ack_term_(0)
             , last_read_index_probe_generation_(0)
             , read_index_timing_()
+            , liveness_timing_()
             , is_voter_(false)
             {}
 
@@ -751,6 +756,9 @@ public:
 
         /** Per-peer request generation and RTT details, enabled by timing option. */
         read_index_rpc_timing_snapshot read_index_timing_;
+
+        /** Per-peer replication and liveness lock timing diagnostics. */
+        peer_liveness_timing_snapshot liveness_timing_;
 
         /** Whether this peer participates in the current leader quorum. */
         bool is_voter_;
@@ -1674,6 +1682,7 @@ protected:
         read_index_probe_trackers_;
     std::atomic<bool> read_index_timing_enabled_{false};
     std::atomic<uint64_t> heartbeat_side_channel_sent_{0};
+    std::atomic<uint64_t> heartbeat_side_channel_accepted_{0};
     std::atomic<uint64_t> heartbeat_side_channel_failed_{0};
 
     /**

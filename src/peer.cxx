@@ -122,14 +122,18 @@ bool peer::send_req( ptr<peer> myself,
         }
     }
 
-    // The flag is passed by raft_server and is normally false. Only requests
-    // carrying a ReadIndex generation pay for the clock read.
+    // Capture RPC RTT for AppendEntries and the isolated heartbeat channel.
+    // All other requests reuse this timestamp only if ReadIndex timing asks
+    // for it.
     const bool capture_read_index_timing =
         read_index_timing && req &&
         req->get_read_index_probe_generation() != 0;
-    const auto sent_at = capture_read_index_timing
-                             ? std::chrono::steady_clock::now()
-                             : std::chrono::steady_clock::time_point{};
+    const bool capture_rpc_timing = heartbeat_side_channel ||
+        (!read_index_channel && req &&
+         req->get_type() == append_entries_request);
+    const auto sent_at = (capture_read_index_timing || capture_rpc_timing)
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
     rpc_handler h = (rpc_handler)std::bind
                     ( &peer::handle_rpc_result,
@@ -149,6 +153,8 @@ bool peer::send_req( ptr<peer> myself,
                       std::placeholders::_2 );
     if (rpc_local) {
         myself->bytes_in_flight_add(req_size_bytes);
+        if (heartbeat_side_channel)
+            record_heartbeat_side_channel_sent();
         rpc_local->send(req, h, send_timeout_ms);
         return true;
     }
@@ -175,18 +181,31 @@ void peer::handle_rpc_result( ptr<peer> myself,
                               ptr<resp_msg>& resp,
                               ptr<rpc_exception>& err )
 {
-    if (read_index_timing) {
-        const uint64_t elapsed_us = static_cast<uint64_t>(
+    uint64_t rpc_elapsed_us = 0;
+    if (read_index_timing || heartbeat_side_channel ||
+        (!read_index_channel && req &&
+         req->get_type() == append_entries_request)) {
+        rpc_elapsed_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - sent_at)
                 .count());
+    }
+    if (heartbeat_side_channel) {
+        heartbeat_side_channel_rtt_.record(rpc_elapsed_us);
+    } else if (!read_index_channel && req &&
+               req->get_type() == append_entries_request) {
+        append_rpc_rtt_.record(rpc_elapsed_us);
+    }
+
+    if (read_index_timing) {
         const uint64_t generation =
             req ? req->get_read_index_probe_generation() : 0;
         const uint64_t term = req ? req->get_term() : 0;
         const bool accepted = resp && resp->get_accepted() &&
                               resp->get_term() == term;
         const uint64_t outcome = err != nilptr ? 3 : (accepted ? 1 : 2);
-        record_read_index_rpc_result(generation, term, outcome, elapsed_us);
+        record_read_index_rpc_result(generation, term, outcome,
+                                     rpc_elapsed_us);
     }
 
     if (abandoned_) {
@@ -271,6 +290,8 @@ void peer::handle_rpc_result( ptr<peer> myself,
 
     } else {
         // Failed.
+        if (heartbeat_side_channel)
+            record_heartbeat_side_channel_failed();
 
         // NOTE: Explicit failure is also treated as an activity
         //       of that connection.

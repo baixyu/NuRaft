@@ -268,6 +268,83 @@ public:
 
     read_index_rpc_timing_snapshot get_read_index_rpc_timing_snapshot() const;
 
+    void record_append_rpc_rtt(uint64_t elapsed_us) {
+        append_rpc_rtt_.record(elapsed_us);
+    }
+    void record_inbound_append_lock_wait(uint64_t elapsed_us) {
+        inbound_append_lock_wait_.record(elapsed_us);
+    }
+    void record_inbound_append_lock_hold(uint64_t elapsed_us) {
+        inbound_append_lock_hold_.record(elapsed_us);
+    }
+    void record_inbound_append_handler(uint64_t elapsed_us) {
+        inbound_append_handler_.record(elapsed_us);
+    }
+    void record_inbound_append_log_work(uint64_t elapsed_us) {
+        inbound_append_log_work_.record(elapsed_us);
+    }
+    void record_inbound_append_durable_wait(uint64_t elapsed_us) {
+        inbound_append_durable_wait_.record(elapsed_us);
+    }
+    void record_inbound_append_commit(uint64_t elapsed_us) {
+        inbound_append_commit_.record(elapsed_us);
+    }
+    void record_raft_response_lock_wait(uint64_t elapsed_us) {
+        raft_response_lock_wait_.record(elapsed_us);
+    }
+    void record_heartbeat_timer_lock_wait(uint64_t elapsed_us) {
+        heartbeat_timer_lock_wait_.record(elapsed_us);
+    }
+    void record_heartbeat_side_channel_lock_wait(uint64_t elapsed_us) {
+        heartbeat_side_channel_lock_wait_.record(elapsed_us);
+    }
+    void record_election_timer_lock_wait(uint64_t elapsed_us) {
+        election_timer_lock_wait_.record(elapsed_us);
+    }
+    void record_liveness_lock_hold(uint64_t elapsed_us) {
+        liveness_lock_hold_.record(elapsed_us);
+    }
+    void record_heartbeat_side_channel_sent() {
+        heartbeat_side_channel_sent_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void record_heartbeat_side_channel_accepted() {
+        heartbeat_side_channel_accepted_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    }
+    void record_heartbeat_side_channel_failed() {
+        heartbeat_side_channel_failed_.fetch_add(1,
+                                                 std::memory_order_relaxed);
+    }
+    peer_liveness_timing_snapshot get_peer_liveness_timing_snapshot() const {
+        peer_liveness_timing_snapshot result;
+        result.append_rpc_rtt = append_rpc_rtt_.snapshot();
+        result.inbound_append_lock_wait =
+            inbound_append_lock_wait_.snapshot();
+        result.inbound_append_lock_hold =
+            inbound_append_lock_hold_.snapshot();
+        result.inbound_append_handler = inbound_append_handler_.snapshot();
+        result.inbound_append_log_work = inbound_append_log_work_.snapshot();
+        result.inbound_append_durable_wait =
+            inbound_append_durable_wait_.snapshot();
+        result.inbound_append_commit = inbound_append_commit_.snapshot();
+        result.raft_response_lock_wait = raft_response_lock_wait_.snapshot();
+        result.heartbeat_timer_lock_wait =
+            heartbeat_timer_lock_wait_.snapshot();
+        result.heartbeat_side_channel_rtt =
+            heartbeat_side_channel_rtt_.snapshot();
+        result.heartbeat_side_channel_lock_wait =
+            heartbeat_side_channel_lock_wait_.snapshot();
+        result.election_timer_lock_wait = election_timer_lock_wait_.snapshot();
+        result.liveness_lock_hold = liveness_lock_hold_.snapshot();
+        result.heartbeat_side_channel_sent =
+            heartbeat_side_channel_sent_.load(std::memory_order_relaxed);
+        result.heartbeat_side_channel_accepted =
+            heartbeat_side_channel_accepted_.load(std::memory_order_relaxed);
+        result.heartbeat_side_channel_failed =
+            heartbeat_side_channel_failed_.load(std::memory_order_relaxed);
+        return result;
+    }
+
     void set_pending_commit() {
         pending_commit_flag_.store(true);
     }
@@ -728,6 +805,43 @@ private:
      * Logger instance.
      */
     ptr<logger> l_;
+
+    // Cumulative, per-peer timing used to distinguish transport delay from
+    // waits for NuRaft's main lock on the liveness path.
+    atomic_timing_stats append_rpc_rtt_;
+    atomic_timing_stats inbound_append_lock_wait_;
+    atomic_timing_stats inbound_append_lock_hold_;
+    atomic_timing_stats inbound_append_handler_;
+    atomic_timing_stats inbound_append_log_work_;
+    atomic_timing_stats inbound_append_durable_wait_;
+    atomic_timing_stats inbound_append_commit_;
+    atomic_timing_stats raft_response_lock_wait_;
+    atomic_timing_stats heartbeat_timer_lock_wait_;
+    atomic_timing_stats heartbeat_side_channel_rtt_;
+    atomic_timing_stats heartbeat_side_channel_lock_wait_;
+    atomic_timing_stats election_timer_lock_wait_;
+    atomic_timing_stats liveness_lock_hold_;
+    std::atomic<uint64_t> heartbeat_side_channel_sent_{0};
+    std::atomic<uint64_t> heartbeat_side_channel_accepted_{0};
+    std::atomic<uint64_t> heartbeat_side_channel_failed_{0};
+};
+
+/** Records how long a liveness-path caller held the shared Raft mutex. */
+class peer_liveness_lock_hold_scope {
+public:
+    explicit peer_liveness_lock_hold_scope(ptr<peer> peer_ptr)
+        : peer_(peer_ptr), started_at_(std::chrono::steady_clock::now()) {}
+
+    ~peer_liveness_lock_hold_scope() {
+        if (!peer_) return;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started_at_).count();
+        peer_->record_liveness_lock_hold(static_cast<uint64_t>(elapsed));
+    }
+
+private:
+    ptr<peer> peer_;
+    std::chrono::steady_clock::time_point started_at_;
 };
 
 }

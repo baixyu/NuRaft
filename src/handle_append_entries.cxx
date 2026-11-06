@@ -35,6 +35,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <sstream>
 
 namespace nuraft {
@@ -652,6 +653,8 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         std::atomic<bool>* val;
     } _s_req(&serving_req_);
     timer_helper tt;
+    const auto log_work_started = std::chrono::steady_clock::now();
+    uint64_t durable_wait_us = 0;
 
     p_tr("from peer %d, req type: %d, req term: %" PRIu64 ", "
          "req l idx: %" PRIu64 " (%zu), req c idx: %" PRIu64 ", "
@@ -781,7 +784,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
         // Since this decline is on purpose, we should not let this server
         // initiaite leader election.
-        restart_election_timer();
+        restart_election_timer(req.get_src());
 
         return resp;
     }
@@ -932,6 +935,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
         ptr<raft_params> params = ctx_->get_params();
         if (params->parallel_log_appending_) {
+            const auto durable_wait_started = std::chrono::steady_clock::now();
             uint64_t last_durable_index = log_store_->last_durable_index();
             while ( last_durable_index <
                     req.get_last_log_idx() + req.log_entries().size() ) {
@@ -947,8 +951,19 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                 last_durable_index = log_store_->last_durable_index();
                 p_tr( "wake up, durable index %" PRIu64, last_durable_index );
             }
+            durable_wait_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - durable_wait_started)
+                    .count());
         }
     }
+    const uint64_t log_work_total_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - log_work_started).count());
+    const uint64_t log_work_us =
+        log_work_total_us > durable_wait_us
+            ? log_work_total_us - durable_wait_us
+            : 0;
 
     leader_ = req.get_src();
 
@@ -990,6 +1005,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     //   be greater than the last log index this server already has. We should
     //   always compare the target index with current precommit index, and take
     //   it only when it is greater than the previous one.
+    const auto commit_stage_started = std::chrono::steady_clock::now();
     bool pc_updated = try_update_precommit_index(target_precommit_index);
     if (!pc_updated) {
         // If updating `precommit_index_` failed, we SHOULD NOT update
@@ -997,26 +1013,17 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     } else {
         commit( std::min( req.get_commit_idx(), target_precommit_index ) );
     }
+    const uint64_t commit_stage_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - commit_stage_started).count());
 
     resp->accept(target_precommit_index + 1);
-
-    int32 time_ms = tt.get_us() / 1000;
-    if (time_ms >= ctx_->get_params()->heart_beat_interval_) {
-        // Append entries took longer than HB interval. Warning.
-        p_wn("appending entries from peer %d took long time (%d ms)\n"
-             "req type: %d, req term: %" PRIu64 ", "
-             "req l idx: %" PRIu64 " (%zu), req c idx: %" PRIu64 ", "
-             "my term: %" PRIu64 ", my role: %d",
-             req.get_src(), time_ms, (int)req.get_type(), req.get_term(),
-             req.get_last_log_idx(), req.log_entries().size(), req.get_commit_idx(),
-             state_->get_term(), (int)role_);
-    }
 
     // Modified by Jung-Sang Ahn, Mar 28 2018.
     // Restart election timer here, as this function may take long time.
     if ( req.get_term() == state_->get_term() &&
          role_ == srv_role::follower ) {
-        restart_election_timer();
+        restart_election_timer(req.get_src());
     }
 
     int64 bs_hint = state_machine_->get_next_batch_size_hint_in_bytes();
@@ -1024,6 +1031,30 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     p_tr("batch size hint: %" PRId64 " bytes", bs_hint);
 
     out_of_log_range_ = false;
+
+    const uint64_t total_us = static_cast<uint64_t>(tt.get_us());
+    auto source_peer_it = peers_.find(req.get_src());
+    if (source_peer_it != peers_.end()) {
+        source_peer_it->second->record_inbound_append_handler(total_us);
+        source_peer_it->second->record_inbound_append_log_work(log_work_us);
+        source_peer_it->second->record_inbound_append_durable_wait(
+            durable_wait_us);
+        source_peer_it->second->record_inbound_append_commit(commit_stage_us);
+    }
+    const int32 time_ms = static_cast<int32>(total_us / 1000);
+    if (time_ms >= ctx_->get_params()->heart_beat_interval_) {
+        p_wn("appending entries from peer %d took long time (%d ms; "
+             "handler=%" PRIu64 " us log_work=%" PRIu64
+             " us durable_wait=%" PRIu64 " us "
+             "commit=%" PRIu64 " us)\nreq type: %d, req term: %" PRIu64 ", "
+             "req l idx: %" PRIu64 " (%zu), req c idx: %" PRIu64 ", "
+             "my term: %" PRIu64 ", my role: %d",
+             req.get_src(), time_ms, total_us, log_work_us,
+             durable_wait_us, commit_stage_us,
+             (int)req.get_type(), req.get_term(), req.get_last_log_idx(),
+             req.log_entries().size(), req.get_commit_idx(), state_->get_term(),
+             (int)role_);
+    }
 
     return resp;
 }

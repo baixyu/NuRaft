@@ -37,7 +37,9 @@ limitations under the License.
 #include "state_mgr.hxx"
 #include "tracer.hxx"
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -772,7 +774,22 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
         return handle_cli_req_prelock(req, ext_params);
     }
 
+    const bool is_append_request =
+        req.get_type() == msg_type::append_entries_request;
+    const auto lock_wait_started = std::chrono::steady_clock::now();
     recur_lock(lock_);
+    const uint64_t lock_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lock_wait_started).count());
+    const auto lock_acquired_at = std::chrono::steady_clock::now();
+    ptr<peer> append_source_peer;
+    if (is_append_request) {
+        auto source_it = peers_.find(req.get_src());
+        if (source_it != peers_.end()) {
+            append_source_peer = source_it->second;
+            append_source_peer->record_inbound_append_lock_wait(lock_wait_us);
+        }
+    }
     if ( req.get_type() == msg_type::append_entries_request ||
          req.get_type() == msg_type::request_vote_request ||
          req.get_type() == msg_type::install_snapshot_request ) {
@@ -839,6 +856,26 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
               resp->get_next_idx() );
     }
 
+    if (is_append_request) {
+        const uint64_t lock_hold_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - lock_acquired_at).count());
+        if (append_source_peer)
+            append_source_peer->record_inbound_append_lock_hold(lock_hold_us);
+        const uint64_t slow_threshold_us =
+            static_cast<uint64_t>(
+                std::max(ctx_->get_params()->heart_beat_interval_, 1)) * 1000;
+        if (lock_wait_us >= slow_threshold_us ||
+            lock_hold_us >= slow_threshold_us) {
+            p_wn("Percona Raft AppendEntries main-lock timing from peer %d: "
+                 "lock_wait=%" PRIu64 " us lock_hold=%" PRIu64
+                 " us entries=%zu probe_only=%d req_term=%" PRIu64,
+                 req.get_src(), lock_wait_us, lock_hold_us,
+                 req.log_entries().size(),
+                 req.is_read_index_probe_only() ? 1 : 0, req.get_term());
+        }
+    }
+
     return resp;
 }
 
@@ -878,7 +915,20 @@ void raft_server::reset_peer_info() {
 }
 
 void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
+    const auto lock_wait_started = std::chrono::steady_clock::now();
     recur_lock(lock_);
+    const auto lock_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lock_wait_started).count());
+    int32 peer_id = resp ? resp->get_src() : -1;
+    if (peer_id < 0 && err && err->req()) peer_id = err->req()->get_dst();
+    ptr<peer> timing_peer;
+    auto peer_it = peers_.find(peer_id);
+    if (peer_it != peers_.end()) {
+        timing_peer = peer_it->second;
+        timing_peer->record_raft_response_lock_wait(lock_wait_us);
+    }
+    peer_liveness_lock_hold_scope lock_hold_scope(timing_peer);
     handle_peer_resp_locked(resp, err);
 }
 
@@ -1860,6 +1910,7 @@ raft_server::peer_info raft_server::get_peer_info(int32 srv_id) const {
     ret.last_read_index_probe_generation_ =
         pp->get_last_read_index_probe_generation();
     ret.read_index_timing_ = pp->get_read_index_rpc_timing_snapshot();
+    ret.liveness_timing_ = pp->get_peer_liveness_timing_snapshot();
     ret.is_voter_ = !pp->is_learner() && !pp->is_new_joiner() &&
                     (!srv_to_leave_ || srv_to_leave_->get_id() != pp->get_id());
     return ret;
@@ -1895,6 +1946,7 @@ void raft_server::get_peer_info_all(
         pi.last_read_index_probe_generation_ =
             pp->get_last_read_index_probe_generation();
         pi.read_index_timing_ = pp->get_read_index_rpc_timing_snapshot();
+        pi.liveness_timing_ = pp->get_peer_liveness_timing_snapshot();
         pi.is_voter_ = !pp->is_learner() && !pp->is_new_joiner() &&
                        (!srv_to_leave_ ||
                         srv_to_leave_->get_id() != pp->get_id());
