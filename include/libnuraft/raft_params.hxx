@@ -101,6 +101,7 @@ struct raft_params {
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
         , max_bytes_in_flight_in_stream_(0)
+        , heartbeat_side_channel_(false)
         {}
 
     /**
@@ -657,6 +658,12 @@ public:
      * specified byte limit. This limitation is effective only in streaming mode.
      */
     int64_t max_bytes_in_flight_in_stream_;
+
+    /**
+     * If enabled, periodic heartbeats may use an isolated per-peer RPC socket
+     * while the replication socket is waiting for an AppendEntries response.
+     */
+    bool heartbeat_side_channel_;
 };
 
 }

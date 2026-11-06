@@ -83,6 +83,8 @@ public:
         read_index_probe_generation_ = generation;
     }
 
+    // True for a ReadIndex probe or heartbeat side-channel AppendEntries;
+    // these responses only prove peer liveness and never advance replication.
     bool is_read_index_probe_only() const {
         return read_index_probe_only_;
     }

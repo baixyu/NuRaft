@@ -143,6 +143,16 @@ public:
         return busy_flag_;
     }
 
+    bool mark_heartbeat_side_channel_used() {
+        return !heartbeat_side_channel_used_.exchange(true,
+                                                       std::memory_order_relaxed);
+    }
+
+    bool mark_heartbeat_side_channel_failure_logged() {
+        return !heartbeat_side_channel_failure_logged_.exchange(
+            true, std::memory_order_relaxed);
+    }
+
     void set_free() {
         busy_flag_.store(false);
     }
@@ -302,7 +312,8 @@ public:
                   bool streaming = false,
                   bool read_index_channel = false,
                   uint64_t send_timeout_ms = 0,
-                  bool read_index_timing = false);
+                  bool read_index_timing = false,
+                  bool heartbeat_side_channel = false);
 
     void shutdown();
 
@@ -435,6 +446,7 @@ private:
                            ptr<rpc_result>& pending_result,
                            bool streaming,
                            bool read_index_channel,
+                           bool heartbeat_side_channel,
                            size_t req_size_bytes,
                            bool read_index_timing,
                            std::chrono::steady_clock::time_point sent_at,
@@ -471,6 +483,11 @@ private:
     // saturation sends the read back to the periodic replication path.
     static constexpr size_t max_read_index_rpc_slots_ = 256;
     std::vector<read_index_rpc_slot> rpc_read_index_pool_;
+    /** One outstanding heartbeat probe socket, isolated from both RPC paths. */
+    ptr<rpc_client> rpc_heartbeat_side_channel_;
+    bool heartbeat_side_channel_busy_{false};
+    std::atomic<bool> heartbeat_side_channel_used_{false};
+    std::atomic<bool> heartbeat_side_channel_failure_logged_{false};
     std::atomic<uint64_t> read_index_rpc_pool_saturations_{0};
     std::atomic<uint64_t> read_index_dispatch_failures_{0};
     std::atomic<uint64_t> read_index_rpc_callbacks_{0};

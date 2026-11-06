@@ -102,8 +102,9 @@ private:
     // Process-local ReadIndex correlation; not part of the wire format.
     uint64_t read_index_probe_generation_;
 
-    // A probe-only AppendEntries may overlap a replication request. Its
-    // response must never move the peer's replication matched/next indexes.
+    // A probe-only AppendEntries (ReadIndex or heartbeat liveness probe) may
+    // overlap a replication request. Its response must never move the peer's
+    // replication matched/next indexes.
     bool read_index_probe_only_;
 
     // Logs. Can be empty.

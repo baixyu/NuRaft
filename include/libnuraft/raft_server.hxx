@@ -334,6 +334,15 @@ public:
      */
     read_index_probe_result request_read_index_probe(uint64_t timeout_ms);
 
+    /** Cumulative local process counters for heartbeat RPCs sent outside the
+        replication connection because that connection was busy. */
+    uint64_t heartbeat_side_channel_sent() const {
+        return heartbeat_side_channel_sent_.load(std::memory_order_relaxed);
+    }
+    uint64_t heartbeat_side_channel_failed() const {
+        return heartbeat_side_channel_failed_.load(std::memory_order_relaxed);
+    }
+
     /** Enable optional per-peer timings for requests carrying ReadIndex generations. */
     void set_read_index_timing_enabled(bool enabled) {
         read_index_timing_enabled_.store(enabled, std::memory_order_relaxed);
@@ -1147,6 +1156,10 @@ protected:
     void handle_read_index_probe_resp(ptr<peer> p, uint64_t generation,
                                       ptr<resp_msg>& resp,
                                       ptr<rpc_exception>& err);
+    void dispatch_heartbeat_side_channel(ptr<peer> p);
+    void handle_heartbeat_side_channel_resp(ptr<peer> p,
+                                            ptr<resp_msg>& resp,
+                                            ptr<rpc_exception>& err);
     ptr<req_msg> create_append_entries_req(ptr<peer>& pp, ulong custom_last_log_idx = 0);
     ptr<req_msg> create_sync_snapshot_req(ptr<peer>& pp,
                                           ulong last_log_idx,
@@ -1660,6 +1673,8 @@ protected:
     std::vector<std::weak_ptr<read_index_probe_tracker>>
         read_index_probe_trackers_;
     std::atomic<bool> read_index_timing_enabled_{false};
+    std::atomic<uint64_t> heartbeat_side_channel_sent_{0};
+    std::atomic<uint64_t> heartbeat_side_channel_failed_{0};
 
     /**
      * Lock of handling client request and role change.

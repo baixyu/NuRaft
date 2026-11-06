@@ -26,6 +26,7 @@ limitations under the License.
 #include "state_mgr.hxx"
 #include "tracer.hxx"
 
+#include <algorithm>
 #include <cassert>
 #include <sstream>
 
@@ -142,7 +143,19 @@ void raft_server::handle_hb_timeout(int32 srv_id) {
     p_db("heartbeat timeout for %d", p->get_id());
     if (role_ == srv_role::leader) {
         update_target_priority();
-        request_append_entries(p);
+        const bool replication_request_sent = request_append_entries(p);
+        const ptr<raft_params> params = ctx_->get_params();
+        const uint64_t heartbeat_interval_us = static_cast<uint64_t>(
+            std::max(params->heart_beat_interval_, 1)) * 1000;
+        if (!replication_request_sent && params->heartbeat_side_channel_ &&
+            p->is_busy() && p->get_last_streamed_log_idx() == 0 &&
+            p->get_ls_timer_us() >= heartbeat_interval_us) {
+            // Streaming already allows a heartbeat to pass an earlier
+            // AppendEntries. In non-streaming mode, keep liveness traffic on
+            // its own socket when the replication request has occupied the
+            // normal peer connection for at least one heartbeat interval.
+            dispatch_heartbeat_side_channel(p);
+        }
         {
             std::lock_guard<std::mutex> guard(p->get_lock());
             if (p->is_hb_enabled()) {
@@ -157,6 +170,82 @@ void raft_server::handle_hb_timeout(int32 srv_id) {
         p_wn("Receive a heartbeat event for %d "
              "while no longer as a leader", p->get_id());
     }
+}
+
+void raft_server::dispatch_heartbeat_side_channel(ptr<peer> p) {
+    if (!p || role_ != srv_role::leader || stopping_) return;
+
+    const ptr<raft_params> params = ctx_->get_params();
+    const ulong start_index = log_store_->start_index();
+    const ulong min_prev_index = start_index == 0 ? 0 : start_index - 1;
+    const ulong prev_index = std::max(p->get_matched_idx(), min_prev_index);
+    const ulong prev_term = term_for_log(prev_index);
+    ptr<req_msg> request = cs_new<req_msg>(
+        state_->get_term(), msg_type::append_entries_request, id_, p->get_id(),
+        prev_term, prev_index, quick_commit_index_.load());
+    // This is process-local metadata: the follower receives an ordinary empty
+    // AppendEntries request, while its response must not move replication
+    // next/matched indexes on the leader.
+    request->set_read_index_probe_only(true);
+
+    if (p->mark_heartbeat_side_channel_used())
+        p_in("Percona Raft heartbeat side channel first used for peer %d: "
+             "replication RPC remained busy for at least %d ms",
+             p->get_id(), params->heart_beat_interval_);
+
+    rpc_handler handler = [this, p](ptr<resp_msg>& response,
+                                    ptr<rpc_exception>& error) {
+        handle_heartbeat_side_channel_resp(p, response, error);
+    };
+    const int32 response_limit = std::max(
+        raft_server::get_raft_limits().response_limit_.load(), 1);
+    const uint64_t timeout_ms = static_cast<uint64_t>(
+        std::max(params->heart_beat_interval_, 1)) * response_limit;
+    if (!p->send_req(p, request, handler, false, false, timeout_ms, false,
+                     true)) {
+        heartbeat_side_channel_failed_.fetch_add(1,
+                                                std::memory_order_relaxed);
+        if (p->mark_heartbeat_side_channel_failure_logged())
+            p_wn("Percona Raft heartbeat side channel could not dispatch to "
+                 "peer %d; the isolated heartbeat socket is busy or unavailable",
+                 p->get_id());
+        return;
+    }
+    cb_func::Param sent_param(id_, leader_, p->get_id(), request.get());
+    ctx_->cb_func_.call(cb_func::SentAppendEntriesReq, &sent_param);
+    heartbeat_side_channel_sent_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void raft_server::handle_heartbeat_side_channel_resp(
+    ptr<peer> p, ptr<resp_msg>& response, ptr<rpc_exception>& error) {
+    if (error || !response) {
+        heartbeat_side_channel_failed_.fetch_add(1,
+                                                std::memory_order_relaxed);
+        if (p && p->mark_heartbeat_side_channel_failure_logged())
+            p_wn("Percona Raft heartbeat side channel to peer %d failed: %s",
+                 p->get_id(), error ? error->what() : "empty response");
+        // A failure on the isolated heartbeat socket must not mark the peer
+        // lost or alter the main replication connection's busy state.
+        return;
+    }
+
+    recur_lock(lock_);
+    const bool accepted_in_current_term =
+        response->get_accepted() && response->get_term() == state_->get_term();
+    if (!accepted_in_current_term) {
+        heartbeat_side_channel_failed_.fetch_add(1,
+                                                std::memory_order_relaxed);
+        if (p && p->mark_heartbeat_side_channel_failure_logged())
+            p_wn("Percona Raft heartbeat side channel response from peer %d "
+                 "did not confirm current-term liveness: accepted=%d "
+                 "response_term=%" PRIu64 " current_term=%" PRIu64
+                 " next_idx=%" PRIu64,
+                 p->get_id(), response->get_accepted() ? 1 : 0,
+                 response->get_term(), state_->get_term(),
+                 response->get_next_idx());
+    }
+    ptr<rpc_exception> no_error;
+    handle_peer_resp_locked(response, no_error);
 }
 
 void raft_server::restart_election_timer() {

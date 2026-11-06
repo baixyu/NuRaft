@@ -36,7 +36,8 @@ bool peer::send_req( ptr<peer> myself,
                      bool streaming,
                      bool read_index_channel,
                      uint64_t send_timeout_ms,
-                     bool read_index_timing )
+                     bool read_index_timing,
+                     bool heartbeat_side_channel )
 {
     if (abandoned_) {
         p_er("peer %d has been shut down, cannot send request",
@@ -86,6 +87,18 @@ bool peer::send_req( ptr<peer> myself,
                     rpc_read_index_pool_.push_back(std::move(slot));
                 }
             }
+        } else if (heartbeat_side_channel) {
+            if (!heartbeat_side_channel_busy_) {
+                if ((!rpc_heartbeat_side_channel_ ||
+                     rpc_heartbeat_side_channel_->is_abandoned()) &&
+                    rpc_factory_)
+                    rpc_heartbeat_side_channel_ =
+                        rpc_factory_->create_client(config_->get_endpoint());
+                if (rpc_heartbeat_side_channel_) {
+                    heartbeat_side_channel_busy_ = true;
+                    rpc_local = rpc_heartbeat_side_channel_;
+                }
+            }
         } else {
             rpc_local = rpc_;
         }
@@ -97,7 +110,7 @@ bool peer::send_req( ptr<peer> myself,
                 read_index_rpc_pool_saturations_.fetch_add(
                     1, std::memory_order_relaxed);
             p_tr("rpc local is null or ReadIndex RPC pool is full");
-            if (!read_index_channel) set_free();
+            if (!read_index_channel && !heartbeat_side_channel) set_free();
             return false;
         }
     }
@@ -128,6 +141,7 @@ bool peer::send_req( ptr<peer> myself,
                       pending,
                       streaming,
                       read_index_channel,
+                      heartbeat_side_channel,
                       req_size_bytes,
                       capture_read_index_timing,
                       sent_at,
@@ -154,6 +168,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                               ptr<rpc_result>& pending_result,
                               bool streaming,
                               bool read_index_channel,
+                              bool heartbeat_side_channel,
                               size_t req_size_bytes,
                               bool read_index_timing,
                               std::chrono::steady_clock::time_point sent_at,
@@ -197,11 +212,14 @@ void peer::handle_rpc_result( ptr<peer> myself,
         {   std::lock_guard<std::mutex> l(rpc_protector_);
             // The same as below, freeing busy flag should be done
             // only if the RPC hasn't been changed.
-            const ptr<rpc_client> current_rpc = read_index_channel
-                ? (read_index_slot < rpc_read_index_pool_.size()
-                       ? rpc_read_index_pool_[read_index_slot].rpc
-                       : ptr<rpc_client>())
-                : rpc_;
+            const ptr<rpc_client> current_rpc =
+                read_index_channel
+                    ? (read_index_slot < rpc_read_index_pool_.size()
+                           ? rpc_read_index_pool_[read_index_slot].rpc
+                           : ptr<rpc_client>())
+                    : (heartbeat_side_channel
+                           ? rpc_heartbeat_side_channel_
+                           : rpc_);
             uint64_t cur_rpc_id = current_rpc ? current_rpc->get_id() : 0;
             uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
             if (cur_rpc_id != given_rpc_id) {
@@ -230,12 +248,14 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 if (read_index_channel &&
                     read_index_slot < rpc_read_index_pool_.size())
                     rpc_read_index_pool_[read_index_slot].busy = false;
+                else if (heartbeat_side_channel)
+                    heartbeat_side_channel_busy_ = false;
                 else
                     try_set_free(req->get_type(), streaming);
             }
         }
 
-        if (!read_index_channel) {
+        if (!read_index_channel && !heartbeat_side_channel) {
             reset_active_timer();
             auto_lock(lock_);
             resume_hb_speed();
@@ -244,7 +264,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
         resp->set_peer(myself);
         pending_result->set_result(resp, no_except);
 
-        if (!read_index_channel) {
+        if (!read_index_channel && !heartbeat_side_channel) {
             reconn_backoff_.reset();
             reconn_backoff_.set_duration_ms(1);
         }
@@ -254,24 +274,32 @@ void peer::handle_rpc_result( ptr<peer> myself,
 
         // NOTE: Explicit failure is also treated as an activity
         //       of that connection.
-        if (!read_index_channel) {
+        if (!read_index_channel && !heartbeat_side_channel) {
             reset_active_timer();
             auto_lock(lock_);
             slow_down_hb();
         }
 
-        if (read_index_channel) {
-            // Retire this socket before notifying the ReadIndex completion;
-            // the callback may immediately submit another probe.
+        if (read_index_channel || heartbeat_side_channel) {
+            // Retire this socket before notifying the probe completion; the
+            // callback may immediately submit another request. Isolated
+            // control channels never alter replication busy state.
             {
                 std::lock_guard<std::mutex> l(rpc_protector_);
-                if (read_index_slot < rpc_read_index_pool_.size()) {
+                if (read_index_channel &&
+                    read_index_slot < rpc_read_index_pool_.size()) {
                     auto &slot = rpc_read_index_pool_[read_index_slot];
                     if (slot.rpc && my_rpc_client &&
                         slot.rpc->get_id() == my_rpc_client->get_id()) {
                         slot.rpc.reset();
                         slot.busy = false;
                     }
+                } else if (heartbeat_side_channel &&
+                           rpc_heartbeat_side_channel_ && my_rpc_client &&
+                           rpc_heartbeat_side_channel_->get_id() ==
+                               my_rpc_client->get_id()) {
+                    rpc_heartbeat_side_channel_.reset();
+                    heartbeat_side_channel_busy_ = false;
                 }
             }
             ptr<resp_msg> no_resp;
@@ -476,6 +504,8 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
 
         rpc_ = factory->create_client(config->get_endpoint());
         rpc_read_index_pool_.clear();
+        rpc_heartbeat_side_channel_.reset();
+        heartbeat_side_channel_busy_ = false;
         p_tr("%p reconnect peer %d", rpc_.get(), config_->get_id());
 
         // WARNING:
@@ -506,6 +536,8 @@ void peer::shutdown() {
         std::lock_guard<std::mutex> l(rpc_protector_);
         rpc_.reset();
         rpc_read_index_pool_.clear();
+        rpc_heartbeat_side_channel_.reset();
+        heartbeat_side_channel_busy_ = false;
     }
     hb_task_.reset();
 }
