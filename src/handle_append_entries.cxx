@@ -260,8 +260,8 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                  "reset next log idx (%" PRIu64 ") and matched log idx (%" PRIu64 ")",
                  p->get_id(), p_next_log_idx, p->get_matched_idx());
             p->record_matched_idx_update(
-                {previous_matched_idx, 0, 0, state_->get_term(),
-                 previous_matched_idx > 0, true,
+                {previous_matched_idx, 0, 0, 0, state_->get_term(),
+                 previous_matched_idx > 0, false, true,
                  timer_helper::get_timeofday_us()});
             p->set_next_log_idx(0);
             p->set_matched_idx(0);
@@ -1125,17 +1125,40 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     if (resp.get_accepted()) {
         uint64_t prev_matched_idx = 0;
         uint64_t new_matched_idx = 0;
+        ulong effective_next_idx = 0;
         {
             std::lock_guard<std::mutex> l(p->get_lock());
-            p->set_next_log_idx(resp.get_next_idx());
             prev_matched_idx = p->get_matched_idx();
-            new_matched_idx = resp.get_next_idx() - 1;
+            const auto update = decide_matched_idx_update(
+                prev_matched_idx, p->get_next_log_idx(),
+                p->get_last_ack_term(), resp.get_next_idx(),
+                state_->get_term());
+            const auto response_matched_idx =
+                resp.get_next_idx() == 0 ? 0 : resp.get_next_idx() - 1;
+            new_matched_idx = update.matched_after_;
+            effective_next_idx = update.next_log_idx_after_;
             p->record_matched_idx_update(
-                {prev_matched_idx, resp.get_next_idx(), new_matched_idx,
-                 state_->get_term(), new_matched_idx < prev_matched_idx,
-                 false, timer_helper::get_timeofday_us()});
+                {prev_matched_idx, resp.get_next_idx(), response_matched_idx,
+                 new_matched_idx, state_->get_term(),
+                 response_matched_idx < prev_matched_idx,
+                 update.regression_ignored_, false,
+                 timer_helper::get_timeofday_us()});
             p_tr("peer %d, prev matched idx: %" PRIu64 ", new matched idx: %" PRIu64,
                  p->get_id(), prev_matched_idx, new_matched_idx);
+            if (update.regression_ignored_) {
+                // An older accepted response can arrive after a newer one has
+                // already advanced this peer. Keep the warning useful without
+                // flooding the error log under a sustained response-order race.
+                static timer_helper match_regression_log_timer(1000000, true);
+                if (match_regression_log_timer.timeout_and_reset())
+                    p_wn("ignored regressing accepted AppendEntries response "
+                         "from peer %d: previous matched idx %" PRIu64 ", "
+                         "response next idx %" PRIu64 ", retained matched "
+                         "idx %" PRIu64,
+                         p->get_id(), prev_matched_idx, resp.get_next_idx(),
+                         new_matched_idx);
+            }
+            p->set_next_log_idx(effective_next_idx);
             p->set_matched_idx(new_matched_idx);
             p->set_last_accepted_log_idx(new_matched_idx);
             p->set_last_ack_term(state_->get_term());
@@ -1148,22 +1171,22 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
 
         // Try to enable stream
         int32 max_gap_in_stream = ctx_->get_params()->max_log_gap_in_stream_;
-        ulong acceptable_precommit_idx = resp.get_next_idx() +
+        ulong acceptable_precommit_idx = effective_next_idx +
                                          max_gap_in_stream;
         ulong last_streamed_log_idx = p->get_last_streamed_log_idx();
         p_tr("peer %d, max gap: %d, acceptable_precommit_idx: %" PRIu64 ", "
              "last_streamed_log_idx: %" PRIu64 ", "
              "last_sent: %" PRIu64 ", next_idx: %" PRIu64 "", p->get_id(),
              max_gap_in_stream, acceptable_precommit_idx, last_streamed_log_idx,
-             p->get_last_sent_idx(), resp.get_next_idx());
+             p->get_last_sent_idx(), effective_next_idx);
         if (max_gap_in_stream > 0 &&
             last_streamed_log_idx == 0 &&
-            resp.get_next_idx() > 0 &&
-            p->get_last_sent_idx() < resp.get_next_idx() &&
+            effective_next_idx > 0 &&
+            p->get_last_sent_idx() < effective_next_idx &&
             precommit_index_ < acceptable_precommit_idx) {
             p_in("start stream mode for peer %d at idx: %" PRIu64 "",
-                 p->get_id(), resp.get_next_idx() - 1);
-            p->set_last_streamed_log_idx(0, resp.get_next_idx() - 1);
+                 p->get_id(), effective_next_idx - 1);
+            p->set_last_streamed_log_idx(0, effective_next_idx - 1);
         }
 
         // Try to commit with this response.
@@ -1174,7 +1197,7 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         last_streamed_log_idx = p->get_last_streamed_log_idx();
         ulong next_idx_to_send = last_streamed_log_idx
                                  ? last_streamed_log_idx + 1
-                                 : resp.get_next_idx();
+                                 : effective_next_idx;
         need_to_catchup = p->clear_pending_commit() ||
                           next_idx_to_send < log_store_->next_slot();
 
