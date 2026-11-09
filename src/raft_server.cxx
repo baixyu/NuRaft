@@ -1917,15 +1917,17 @@ raft_server::peer_info raft_server::get_peer_info(int32 srv_id) const {
 }
 
 std::vector<raft_server::peer_info> raft_server::get_peer_info_all(
-    ulong* config_log_index_out) const {
+    ulong* config_log_index_out,
+    bool include_matched_idx_updates) const {
     std::vector<raft_server::peer_info> ret;
-    get_peer_info_all(ret, config_log_index_out);
+    get_peer_info_all(ret, config_log_index_out, include_matched_idx_updates);
     return ret;
 }
 
 void raft_server::get_peer_info_all(
     std::vector<peer_info>& peers_out,
-    ulong* config_log_index_out) const {
+    ulong* config_log_index_out,
+    bool include_matched_idx_updates) const {
     peers_out.clear();
     recur_lock(lock_);
     if (config_log_index_out) *config_log_index_out = 0;
@@ -1943,6 +1945,13 @@ void raft_server::get_peer_info_all(
         pi.last_succ_resp_us_ = pp->get_resp_timer_us();
         pi.matched_idx_ = pp->get_matched_idx();
         pi.last_ack_term_ = pp->get_last_ack_term();
+        if (include_matched_idx_updates) {
+            pi.matched_idx_updates_ = pp->get_matched_idx_update_history();
+            pi.has_rpc_reconnect_reset_ = pp->has_rpc_reconnect_reset();
+            if (pi.has_rpc_reconnect_reset_)
+                pi.last_rpc_reconnect_reset_ =
+                    pp->get_last_rpc_reconnect_reset();
+        }
         pi.last_read_index_probe_generation_ =
             pp->get_last_read_index_probe_generation();
         pi.read_index_timing_ = pp->get_read_index_rpc_timing_snapshot();

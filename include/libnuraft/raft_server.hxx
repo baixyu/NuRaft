@@ -713,6 +713,9 @@ public:
             , matched_idx_(0)
             , last_ack_term_(0)
             , last_read_index_probe_generation_(0)
+            , matched_idx_updates_()
+            , has_rpc_reconnect_reset_(false)
+            , last_rpc_reconnect_reset_()
             , read_index_timing_()
             , liveness_timing_()
             , is_voter_(false)
@@ -754,6 +757,13 @@ public:
         /** Latest locally correlated ReadIndex AppendEntries response. */
         uint64_t last_read_index_probe_generation_;
 
+        /** Recent replication cursor updates, oldest first. */
+        std::vector<matched_idx_update> matched_idx_updates_;
+
+        /** Last RPC reconnect cursor reset, retained beyond the short history. */
+        bool has_rpc_reconnect_reset_;
+        matched_idx_update last_rpc_reconnect_reset_;
+
         /** Per-peer request generation and RTT details, enabled by timing option. */
         read_index_rpc_timing_snapshot read_index_timing_;
 
@@ -778,13 +788,15 @@ public:
      * @return Vector of peer info.
      */
     std::vector<peer_info> get_peer_info_all(
-        ulong* config_log_index_out = nullptr) const;
+        ulong* config_log_index_out = nullptr,
+        bool include_matched_idx_updates = false) const;
     /**
      * Fill a caller-owned vector of all peer info. Reusing its capacity avoids
      * a fresh allocation on repeated ReadIndex quorum snapshots.
      */
     void get_peer_info_all(std::vector<peer_info>& peers_out,
-                           ulong* config_log_index_out) const;
+                           ulong* config_log_index_out,
+                           bool include_matched_idx_updates = false) const;
 
     /** Total ReadIndex RPC pool allocation failures caused by all slots being busy. */
     uint64_t get_read_index_rpc_pool_saturation_count() const;

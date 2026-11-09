@@ -255,9 +255,14 @@ bool raft_server::request_append_entries(ptr<peer> p) {
             //   eventually have the same impact of removing and then
             //   re-adding the peer.
             //
+            const auto previous_matched_idx = p->get_matched_idx();
             p_tr("new rpc for peer %d is created, "
                  "reset next log idx (%" PRIu64 ") and matched log idx (%" PRIu64 ")",
                  p->get_id(), p_next_log_idx, p->get_matched_idx());
+            p->record_matched_idx_update(
+                {previous_matched_idx, 0, 0, state_->get_term(),
+                 previous_matched_idx > 0, true,
+                 timer_helper::get_timeofday_us()});
             p->set_next_log_idx(0);
             p->set_matched_idx(0);
             p->set_last_ack_term(0);
@@ -1125,6 +1130,10 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             p->set_next_log_idx(resp.get_next_idx());
             prev_matched_idx = p->get_matched_idx();
             new_matched_idx = resp.get_next_idx() - 1;
+            p->record_matched_idx_update(
+                {prev_matched_idx, resp.get_next_idx(), new_matched_idx,
+                 state_->get_term(), new_matched_idx < prev_matched_idx,
+                 false, timer_helper::get_timeofday_us()});
             p_tr("peer %d, prev matched idx: %" PRIu64 ", new matched idx: %" PRIu64,
                  p->get_id(), prev_matched_idx, new_matched_idx);
             p->set_matched_idx(new_matched_idx);

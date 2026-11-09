@@ -30,6 +30,7 @@ limitations under the License.
 #include "snapshot_sync_ctx.hxx"
 #include "srv_config.hxx"
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -38,6 +39,18 @@ limitations under the License.
 namespace nuraft {
 
 class snapshot;
+
+/** One recent change to the leader's replication cursor for a peer. */
+struct matched_idx_update {
+    ulong matched_before_{0};
+    ulong response_next_idx_{0};
+    ulong matched_after_{0};
+    ulong term_{0};
+    bool regressed_{false};
+    bool rpc_reconnect_reset_{false};
+    uint64_t time_us_{0};
+};
+
 class peer {
 public:
     peer( ptr<srv_config>& config,
@@ -200,6 +213,38 @@ public:
 
     void set_matched_idx(ulong idx) {
         matched_idx_ = idx;
+    }
+
+    void record_matched_idx_update(const matched_idx_update& update) {
+        matched_idx_updates_[matched_idx_update_next_] = update;
+        matched_idx_update_next_ =
+            (matched_idx_update_next_ + 1) % matched_idx_updates_.size();
+        if (matched_idx_update_count_ < matched_idx_updates_.size())
+            ++matched_idx_update_count_;
+        if (update.rpc_reconnect_reset_) {
+            last_rpc_reconnect_reset_ = update;
+            has_rpc_reconnect_reset_ = true;
+        }
+    }
+
+    std::vector<matched_idx_update> get_matched_idx_update_history() const {
+        std::vector<matched_idx_update> history;
+        history.reserve(matched_idx_update_count_);
+        const size_t first =
+            (matched_idx_update_next_ + matched_idx_updates_.size() -
+             matched_idx_update_count_) % matched_idx_updates_.size();
+        for (size_t i = 0; i < matched_idx_update_count_; ++i)
+            history.push_back(
+                matched_idx_updates_[(first + i) % matched_idx_updates_.size()]);
+        return history;
+    }
+
+    bool has_rpc_reconnect_reset() const {
+        return has_rpc_reconnect_reset_;
+    }
+
+    matched_idx_update get_last_rpc_reconnect_reset() const {
+        return last_rpc_reconnect_reset_;
     }
 
     ulong get_last_ack_term() const {
@@ -626,6 +671,15 @@ private:
      * The last log index whose term matches up with the leader.
      */
     ulong matched_idx_;
+
+    /** Recent cursor updates, copied into peer_info only for diagnostics. */
+    static constexpr size_t matched_idx_update_history_size_ = 8;
+    std::array<matched_idx_update, matched_idx_update_history_size_>
+        matched_idx_updates_{};
+    size_t matched_idx_update_next_{0};
+    size_t matched_idx_update_count_{0};
+    matched_idx_update last_rpc_reconnect_reset_{};
+    bool has_rpc_reconnect_reset_{false};
 
     /**
      * The Leader term in which an accepted AppendEntries response last
