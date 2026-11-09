@@ -27,6 +27,7 @@ limitations under the License.
 #include "timer_task.hxx"
 #include "rpc_cli_factory.hxx"
 #include "read_index_timing.hxx"
+#include "matched_idx_update.hxx"
 #include "snapshot_sync_ctx.hxx"
 #include "srv_config.hxx"
 
@@ -39,18 +40,6 @@ limitations under the License.
 namespace nuraft {
 
 class snapshot;
-
-/** One recent change to the leader's replication cursor for a peer. */
-struct matched_idx_update {
-    ulong matched_before_{0};
-    ulong response_next_idx_{0};
-    ulong matched_after_{0};
-    ulong term_{0};
-    bool regressed_{false};
-    bool rpc_reconnect_reset_{false};
-    uint64_t time_us_{0};
-};
-
 class peer {
 public:
     peer( ptr<srv_config>& config,

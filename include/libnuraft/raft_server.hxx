@@ -26,6 +26,7 @@ limitations under the License.
 #include "internal_timer.hxx"
 #include "log_store.hxx"
 #include "read_index_timing.hxx"
+#include "matched_idx_update.hxx"
 #include "snapshot_sync_req.hxx"
 #include "rpc_cli.hxx"
 #include "srv_config.hxx"
