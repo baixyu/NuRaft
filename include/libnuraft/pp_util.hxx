@@ -21,6 +21,8 @@ limitations under the License.
 #ifndef _PP_UTIL_HXX_
 #define _PP_UTIL_HXX_
 
+#include <type_traits>
+
 #define __override__ override
 
 #define __nocopy__(clazz)                       \
@@ -37,7 +39,8 @@ limitations under the License.
     __nocopy__(clazz)
 
 #define auto_lock(lock)     std::lock_guard<std::mutex> guard(lock)
-#define recur_lock(lock)    std::unique_lock<std::recursive_mutex> guard(lock)
+#define recur_lock(lock)    \
+    std::unique_lock<typename std::remove_reference<decltype(lock)>::type> guard(lock)
 
 #define sz_int      sizeof(int32)
 #define sz_ulong    sizeof(ulong)

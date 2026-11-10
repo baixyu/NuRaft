@@ -1658,7 +1658,7 @@ bool raft_server::update_term(ulong term) {
     return false;
 }
 
-ptr<resp_msg> raft_server::handle_ext_msg(req_msg& req, std::unique_lock<std::recursive_mutex>& guard) {
+ptr<resp_msg> raft_server::handle_ext_msg(req_msg& req, std::unique_lock<timed_recursive_mutex>& guard) {
     switch (req.get_type()) {
     case msg_type::add_server_request:
         return handle_add_srv_req(req);

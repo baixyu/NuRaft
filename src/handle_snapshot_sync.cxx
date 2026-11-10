@@ -236,7 +236,7 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     return req;
 }
 
-ptr<resp_msg> raft_server::handle_install_snapshot_req(req_msg& req, std::unique_lock<std::recursive_mutex>& guard) {
+ptr<resp_msg> raft_server::handle_install_snapshot_req(req_msg& req, std::unique_lock<timed_recursive_mutex>& guard) {
     if (req.get_term() == state_->get_term() && !state_->is_catching_up()) {
         if (role_ == srv_role::candidate) {
             become_follower();
@@ -454,7 +454,7 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
     sync_log_to_new_srv(srv_to_join_->get_next_log_idx());
 }
 
-bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<std::recursive_mutex>& guard) {
+bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<timed_recursive_mutex>& guard) {
  try {
     // if offset == 0, it is the first object.
     bool is_first_obj = (req.get_offset()) ? false : true;

@@ -24,6 +24,7 @@ limitations under the License.
 #include "async.hxx"
 #include "callback.hxx"
 #include "internal_timer.hxx"
+#include "lock_timing.hxx"
 #include "log_store.hxx"
 #include "read_index_timing.hxx"
 #include "matched_idx_update.hxx"
@@ -268,6 +269,14 @@ public:
      * @return `true` if it is ready.
      */
     bool is_initialized() const { return initialized_; }
+
+    /**
+     * Lock wait/hold counters for the server-wide Raft operation lock. This
+     * reads only relaxed atomics and does not acquire `lock_`.
+     */
+    lock_timing_snapshot global_lock_contention() const {
+        return lock_.contention_snapshot();
+    }
 
     /**
      * Check if this server is catching up the current leader
@@ -1127,8 +1136,8 @@ protected:
 
     void drop_all_pending_commit_elems();
 
-    ptr<resp_msg> handle_ext_msg(req_msg& req, std::unique_lock<std::recursive_mutex>& guard);
-    ptr<resp_msg> handle_install_snapshot_req(req_msg& req, std::unique_lock<std::recursive_mutex>& guard);
+    ptr<resp_msg> handle_ext_msg(req_msg& req, std::unique_lock<timed_recursive_mutex>& guard);
+    ptr<resp_msg> handle_install_snapshot_req(req_msg& req, std::unique_lock<timed_recursive_mutex>& guard);
     ptr<resp_msg> handle_rm_srv_req(req_msg& req);
     ptr<resp_msg> handle_add_srv_req(req_msg& req);
     ptr<resp_msg> handle_log_sync_req(req_msg& req);
@@ -1142,7 +1151,7 @@ protected:
     void handle_log_sync_resp(resp_msg& resp);
     void handle_leave_cluster_resp(resp_msg& resp);
 
-    bool handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<std::recursive_mutex>& guard);
+    bool handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<timed_recursive_mutex>& guard);
 
     bool check_cond_for_zp_election();
     bool election_initiation_withheld(bool pre_vote);
@@ -1688,7 +1697,7 @@ protected:
     /**
      * Lock of entire Raft operation.
      */
-    mutable std::recursive_mutex lock_;
+    mutable timed_recursive_mutex lock_;
 
     /** Active ReadIndex rounds are weakly held and updated under `lock_`. */
     std::vector<std::weak_ptr<read_index_probe_tracker>>
