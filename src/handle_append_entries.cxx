@@ -862,6 +862,21 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             for ( uint64_t ii = 0; ii < my_last_log_idx - log_idx + 1; ++ii ) {
                 uint64_t idx = my_last_log_idx - ii;
                 ptr<log_entry> old_entry = log_store_->entry_at(idx);
+                if (!old_entry) {
+                    p_er("NuRaft cannot roll back missing log entry at index %"
+                         PRIu64 " (retained start %" PRIu64 ", next slot %"
+                         PRIu64 ", durable index %" PRIu64 ")",
+                         idx, log_store_->start_index(),
+                         log_store_->next_slot(),
+                         log_store_->last_durable_index());
+                    // A missing entry has no state-machine pre-commit to undo.
+                    // Keep rolling back the rest of the conflicting suffix;
+                    // the overwrite loop below will replace this hole and the
+                    // suffix with the leader's entries. File_log_store::write_at
+                    // still rejects any replacement at/below its durable commit
+                    // watermark, where recovery by overwrite would be unsafe.
+                    continue;
+                }
                 ptr<buffer> buf = old_entry->get_buf_ptr();
                 if (old_entry->get_val_type() == log_val_type::app_log) {
                     buf->pos(0);
