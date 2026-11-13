@@ -507,6 +507,14 @@ public:
                           int successor_id = -1);
 
     /**
+     * Force the local Leader to become a Follower without consulting the
+     * leadership-transfer callback. This is for a local safety fence that
+     * makes the current Leader ineligible to serve; it does not transfer
+     * leadership to a named member or change the current term.
+     */
+    void step_down();
+
+    /**
      * Send a request to the current leader to yield its leadership,
      * and become the next leader.
      *

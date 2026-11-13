@@ -1264,7 +1264,16 @@ void raft_server::become_leader() {
     ulong my_term = state_->get_term();
     param.ctx = &my_term;
     CbReturnCode rc = ctx_->cb_func_.call(cb_func::BecomeLeader, &param);
-    (void)rc; // nothing to do in this callback.
+    if (rc != cb_func::Ok) {
+        // A local safety fence may be raised after ElectionInitiation but
+        // before this callback. Let the callback veto that race before this
+        // node starts sending as Leader.
+        p_wn("[BECOME LEADER] refused by callback, step down immediately");
+        leader_ = -1;
+        become_follower();
+        hb_alive_ = false;
+        return;
+    }
 
     write_paused_ = false;
     next_leader_candidate_ = -1;
@@ -1535,6 +1544,20 @@ void raft_server::yield_leadership(bool immediate_yield,
     reelection_timer_.set_duration_ms
                       ( ctx_->get_params()->election_timeout_upper_bound_ );
     reelection_timer_.reset();
+}
+
+void raft_server::step_down()
+{
+    recur_lock(lock_);
+
+    if (id_ != leader_) return;
+
+    p_wn("local safety fence requested immediate step-down");
+    leader_ = -1;
+    become_follower();
+    // Clear the live flag so a subsequent pre-vote is not rejected as if
+    // this member were still the active Leader.
+    hb_alive_ = false;
 }
 
 bool raft_server::request_leadership() {
