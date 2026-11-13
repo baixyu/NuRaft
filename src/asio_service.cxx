@@ -58,6 +58,7 @@ limitations under the License.
 #include <ctime>
 #include <exception>
 #include <list>
+#include <new>
 #include <thread>
 
 
@@ -447,15 +448,28 @@ public:
 
             } else {
                 // Carry some data, need to read further.
-                ptr<buffer> log_ctx = buffer::alloc((size_t)data_size);
-                aa::read( ssl_enabled_, ssl_socket_, socket_,
-                          asio::buffer( log_ctx->data(),
-                                        (size_t)data_size ),
-                          std::bind( &rpc_session::read_log_data,
-                                     self,
-                                     log_ctx,
-                                     std::placeholders::_1,
-                                     std::placeholders::_2 ) );
+                try {
+                    ptr<buffer> log_ctx = buffer::alloc((size_t)data_size);
+                    aa::read( ssl_enabled_, ssl_socket_, socket_,
+                              asio::buffer( log_ctx->data(),
+                                            (size_t)data_size ),
+                              std::bind( &rpc_session::read_log_data,
+                                         self,
+                                         log_ctx,
+                                         std::placeholders::_1,
+                                         std::placeholders::_2 ) );
+                } catch (const std::bad_alloc& ex) {
+                    // Allocation failure belongs to this connection. Letting
+                    // it escape the Asio completion handler makes worker_entry
+                    // count it toward the process-wide abort threshold, even
+                    // when the advertised frame is the only problem.
+                    p_er("session %" PRIu64 " cannot allocate inbound rpc body "
+                         "from %s:%u: msg_type=%u bytes=%d: %s; stopping session",
+                         session_id_, cached_address_.c_str(), cached_port_,
+                         static_cast<unsigned int>(m_type), data_size,
+                         ex.what());
+                    this->stop();
+                }
             }
         } );
     }
@@ -742,9 +756,13 @@ private:
 
        } catch (std::exception& ex) {
         p_er( "session %" PRIu64 " failed to process request message "
-              "due to error: %s",
+              "due to error: %s (peer=%s:%u, source=%d, body_bytes=%zu)",
               this->session_id_,
-              ex.what() );
+              ex.what(),
+              cached_address_.c_str(),
+              cached_port_,
+              src_id_,
+              log_ctx ? log_ctx->size() : 0 );
         this->stop();
        }
     }

@@ -33,6 +33,7 @@ limitations under the License.
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <new>
 #include <sstream>
 #include <utility>
 
@@ -45,23 +46,37 @@ ptr<resp_msg> raft_server::handle_cli_req_prelock(req_msg& req,
     ptr<raft_params> params = ctx_->get_params();
     uint64_t timestamp_us = timer_helper::get_timeofday_us();
 
-    switch (params->locking_method_type_) {
-        case raft_params::single_mutex: {
-            recur_lock(lock_);
-            resp = handle_cli_req(req, ext_params, timestamp_us);
-            break;
+    try {
+        switch (params->locking_method_type_) {
+            case raft_params::single_mutex: {
+                recur_lock(lock_);
+                resp = handle_cli_req(req, ext_params, timestamp_us);
+                break;
+            }
+            case raft_params::dual_mutex:
+            default: {
+                // TODO: Use RW lock here.
+                recur_lock(cli_lock_);
+                resp = handle_cli_req(req, ext_params, timestamp_us);
+                break;
+            }
         }
-        case raft_params::dual_mutex:
-        default: {
-            // TODO: Use RW lock here.
-            recur_lock(cli_lock_);
-            resp = handle_cli_req(req, ext_params, timestamp_us);
-            break;
-        }
+    } catch (const std::bad_alloc& ex) {
+        p_er("NuRaft client AppendEntries allocation failed during local "
+             "append handling: src=%d entries=%zu: %s",
+             req.get_src(), req.log_entries().size(), ex.what());
+        throw;
     }
 
     // Urgent commit, so that the commit will not depend on hb.
-    request_append_entries_for_all();
+    try {
+        request_append_entries_for_all();
+    } catch (const std::bad_alloc& ex) {
+        p_er("NuRaft client AppendEntries allocation failed during urgent "
+             "replication dispatch: src=%d entries=%zu: %s",
+             req.get_src(), req.log_entries().size(), ex.what());
+        throw;
+    }
 
     return resp;
 }
@@ -268,132 +283,155 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
     ulong resp_idx = 1;
     ulong cur_term = state_->get_term();
     ptr<raft_params> params = ctx_->get_params();
+    const char *allocation_phase = "construct_response";
+    size_t num_entries = 0;
+    size_t current_entry = 0;
 
-    resp = cs_new<resp_msg>( cur_term,
-                             msg_type::append_entries_response,
-                             id_,
-                             leader_ );
-    if (role_ != srv_role::leader || write_paused_) {
-        resp->set_result_code( cmd_result_code::NOT_LEADER );
-        return resp;
-    }
-
-    if (ext_params.expected_term_) {
-        // If expected term is given, check the current term.
-        if (ext_params.expected_term_ != cur_term) {
-            resp->set_result_code( cmd_result_code::TERM_MISMATCH );
+    try {
+        resp = cs_new<resp_msg>( cur_term,
+                                 msg_type::append_entries_response,
+                                 id_,
+                                 leader_ );
+        if (role_ != srv_role::leader || write_paused_) {
+            resp->set_result_code( cmd_result_code::NOT_LEADER );
             return resp;
         }
-    }
 
-    std::vector< ptr<log_entry> >& entries = req.log_entries();
-    size_t num_entries = entries.size();
-
-    for (size_t i = 0; i < num_entries; ++i) {
-        // force the log's term to current term
-        entries.at(i)->set_term(cur_term);
-        entries.at(i)->set_timestamp(timestamp_us);
-
-        ulong next_slot = store_log_entry(entries.at(i));
-        p_db("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
-             next_slot, timestamp_us);
-        last_idx = next_slot;
-
-        ptr<buffer> buf = entries.at(i)->get_buf_ptr();
-        buf->pos(0);
-        ret_value = state_machine_->pre_commit_ext
-                    ( state_machine::ext_op_params( last_idx, buf ) );
-
-        if (ext_params.after_precommit_) {
-            req_ext_cb_params cb_params;
-            cb_params.log_idx = last_idx;
-            cb_params.log_term = cur_term;
-            cb_params.context = ext_params.context_;
-            ext_params.after_precommit_(cb_params);
-        }
-    }
-    if (num_entries) {
-        const auto append_batch_started = std::chrono::steady_clock::now();
-        log_store_->end_of_append_batch(last_idx - num_entries + 1, num_entries);
-        const auto append_batch_ended = std::chrono::steady_clock::now();
-        cb_func::AppendBatchDurabilityArgs durability_args{
-            last_idx - num_entries + 1, last_idx,
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                append_batch_ended - append_batch_started).count()),
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                append_batch_started.time_since_epoch()).count()),
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                append_batch_ended.time_since_epoch()).count())};
-        cb_func::Param durability_param(id_, leader_);
-        durability_param.ctx = &durability_args;
-        ctx_->cb_func_.call(cb_func::LocalAppendBatchDurable, &durability_param);
-    }
-    try_update_precommit_index(last_idx);
-    resp_idx = log_store_->next_slot();
-
-    // Finished appending logs and pre_commit of itself.
-    cb_func::Param param(id_, leader_);
-    param.ctx = &last_idx;
-    CbReturnCode rc = ctx_->cb_func_.call(cb_func::AppendLogs, &param);
-    if (rc == CbReturnCode::ReturnNull) return nullptr;
-
-    size_t sleep_us = debugging_options::get_instance()
-                      .handle_cli_req_sleep_us_.load(std::memory_order_relaxed);
-    if (sleep_us) {
-        // Sleep if the debugging option is given.
-        timer_helper::sleep_us(sleep_us);
-    }
-
-    if (!get_config()->is_async_replication()) {
-        // Sync replication:
-        //   Set callback function for `last_idx`.
-        ptr<commit_ret_elem> elem = cs_new<commit_ret_elem>();
-        elem->idx_ = last_idx;
-        elem->result_code_ = cmd_result_code::TIMEOUT;
-
-        {   auto_lock(commit_ret_elems_lock_);
-            auto entry = commit_ret_elems_.find(last_idx);
-            if (entry != commit_ret_elems_.end()) {
-                // Commit thread was faster than this.
-                elem = entry->second;
-                p_tr("commit thread was faster than this thread: %p", elem.get());
-            } else {
-                commit_ret_elems_.insert( std::make_pair(last_idx, elem) );
+        if (ext_params.expected_term_) {
+            // If expected term is given, check the current term.
+            if (ext_params.expected_term_ != cur_term) {
+                resp->set_result_code( cmd_result_code::TERM_MISMATCH );
+                return resp;
             }
+        }
 
-            switch (ctx_->get_params()->return_method_) {
-            case raft_params::blocking:
-            default:
-                // Blocking call: set callback function waiting for the result.
-                resp->set_cb( std::bind( &raft_server::handle_cli_req_callback,
-                                         this,
-                                         elem,
-                                         std::placeholders::_1 ) );
-                break;
+        std::vector< ptr<log_entry> >& entries = req.log_entries();
+        num_entries = entries.size();
 
-            case raft_params::async_handler:
-                // Async handler: create & set async result object.
-                if (!elem->async_result_) {
-                    elem->async_result_ = cs_new< cmd_result< ptr<buffer> > >();
+        for (size_t i = 0; i < num_entries; ++i) {
+            current_entry = i;
+            // force the log's term to current term
+            entries.at(i)->set_term(cur_term);
+            entries.at(i)->set_timestamp(timestamp_us);
+
+            allocation_phase = "store_log_entry";
+            ulong next_slot = store_log_entry(entries.at(i));
+            p_db("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
+                 next_slot, timestamp_us);
+            last_idx = next_slot;
+
+            allocation_phase = "state_machine_pre_commit";
+            ptr<buffer> buf = entries.at(i)->get_buf_ptr();
+            buf->pos(0);
+            ret_value = state_machine_->pre_commit_ext
+                        ( state_machine::ext_op_params( last_idx, buf ) );
+
+            if (ext_params.after_precommit_) {
+                allocation_phase = "after_pre_commit_callback";
+                req_ext_cb_params cb_params;
+                cb_params.log_idx = last_idx;
+                cb_params.log_term = cur_term;
+                cb_params.context = ext_params.context_;
+                ext_params.after_precommit_(cb_params);
+            }
+        }
+        if (num_entries) {
+            const auto append_batch_started = std::chrono::steady_clock::now();
+            allocation_phase = "end_of_append_batch";
+            log_store_->end_of_append_batch(last_idx - num_entries + 1, num_entries);
+            const auto append_batch_ended = std::chrono::steady_clock::now();
+            cb_func::AppendBatchDurabilityArgs durability_args{
+                last_idx - num_entries + 1, last_idx,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    append_batch_ended - append_batch_started).count()),
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    append_batch_started.time_since_epoch()).count()),
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    append_batch_ended.time_since_epoch()).count())};
+            cb_func::Param durability_param(id_, leader_);
+            durability_param.ctx = &durability_args;
+            allocation_phase = "local_append_batch_durable_callback";
+            ctx_->cb_func_.call(cb_func::LocalAppendBatchDurable, &durability_param);
+        }
+        allocation_phase = "update_precommit_index";
+        try_update_precommit_index(last_idx);
+        allocation_phase = "read_next_slot";
+        resp_idx = log_store_->next_slot();
+
+        // Finished appending logs and pre_commit of itself.
+        cb_func::Param param(id_, leader_);
+        param.ctx = &last_idx;
+        allocation_phase = "append_logs_callback";
+        CbReturnCode rc = ctx_->cb_func_.call(cb_func::AppendLogs, &param);
+        if (rc == CbReturnCode::ReturnNull) return nullptr;
+
+        size_t sleep_us = debugging_options::get_instance()
+                          .handle_cli_req_sleep_us_.load(std::memory_order_relaxed);
+        if (sleep_us) {
+            // Sleep if the debugging option is given.
+            timer_helper::sleep_us(sleep_us);
+        }
+
+        allocation_phase = "get_replication_configuration";
+        if (!get_config()->is_async_replication()) {
+            // Sync replication:
+            //   Set callback function for `last_idx`.
+            allocation_phase = "allocate_commit_result";
+            ptr<commit_ret_elem> elem = cs_new<commit_ret_elem>();
+            elem->idx_ = last_idx;
+            elem->result_code_ = cmd_result_code::TIMEOUT;
+
+            {   auto_lock(commit_ret_elems_lock_);
+                auto entry = commit_ret_elems_.find(last_idx);
+                if (entry != commit_ret_elems_.end()) {
+                    // Commit thread was faster than this.
+                    elem = entry->second;
+                    p_tr("commit thread was faster than this thread: %p", elem.get());
+                } else {
+                    commit_ret_elems_.insert( std::make_pair(last_idx, elem) );
                 }
-                resp->set_async_cb
-                      ( std::bind( &raft_server::handle_cli_req_callback_async,
-                                   this,
-                                   elem->async_result_ ) );
-                break;
+
+                switch (ctx_->get_params()->return_method_) {
+                case raft_params::blocking:
+                default:
+                    // Blocking call: set callback function waiting for the result.
+                    resp->set_cb( std::bind( &raft_server::handle_cli_req_callback,
+                                             this,
+                                             elem,
+                                             std::placeholders::_1 ) );
+                    break;
+
+                case raft_params::async_handler:
+                    // Async handler: create & set async result object.
+                    if (!elem->async_result_) {
+                        elem->async_result_ = cs_new< cmd_result< ptr<buffer> > >();
+                    }
+                    resp->set_async_cb
+                          ( std::bind( &raft_server::handle_cli_req_callback_async,
+                                       this,
+                                       elem->async_result_ ) );
+                    break;
+                }
             }
+
+        } else {
+            // Async replication:
+            //   Immediately return with the result of pre-commit.
+            p_dv( "asynchronously replicated %" PRIu64 ", return value %p",
+                  last_idx, ret_value.get() );
+            resp->set_ctx(ret_value);
         }
 
-    } else {
-        // Async replication:
-        //   Immediately return with the result of pre-commit.
-        p_dv( "asynchronously replicated %" PRIu64 ", return value %p",
-              last_idx, ret_value.get() );
-        resp->set_ctx(ret_value);
+        allocation_phase = "accept_response";
+        resp->accept(resp_idx);
+        return resp;
+    } catch (const std::bad_alloc& ex) {
+        p_er("NuRaft client AppendEntries allocation failed: phase=%s "
+             "entry=%zu/%zu last_log_index=%" PRIu64 " request_entries=%zu: %s",
+             allocation_phase, current_entry, num_entries, last_idx,
+             req.log_entries().size(), ex.what());
+        throw;
     }
-
-    resp->accept(resp_idx);
-    return resp;
 }
 
 ptr<resp_msg> raft_server::handle_cli_req_callback(ptr<commit_ret_elem> elem,

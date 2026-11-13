@@ -27,6 +27,7 @@ limitations under the License.
 #include "tracer.hxx"
 
 #include <cassert>
+#include <new>
 #include <sstream>
 
 namespace nuraft {
@@ -94,19 +95,33 @@ ptr< cmd_result< ptr<buffer> > > raft_server::append_entries_ext
         return cs_new< cmd_result< ptr<buffer> > >(result);
     }
 
-    ptr<req_msg> req = cs_new<req_msg>
-                       ( (ulong)0, msg_type::client_request, 0, 0,
-                         (ulong)0, (ulong)0, (ulong)0 ) ;
-    for (auto it = logs.begin(); it != logs.end(); ++it) {
-        ptr<buffer> buf = *it;
-        // Just in case when user forgot to reset the position.
-        buf->pos(0);
-        ptr<log_entry> log( cs_new<log_entry>
-                            ( 0, *it, log_val_type::app_log ) );
-        req->log_entries().push_back(log);
-    }
+    const char *allocation_phase = "construct_request";
+    size_t current_entry = 0;
+    uint64_t payload_bytes = 0;
+    try {
+        ptr<req_msg> req = cs_new<req_msg>
+                           ( (ulong)0, msg_type::client_request, 0, 0,
+                             (ulong)0, (ulong)0, (ulong)0 ) ;
+        allocation_phase = "build_log_entries";
+        for (auto it = logs.begin(); it != logs.end(); ++it, ++current_entry) {
+            ptr<buffer> buf = *it;
+            // Just in case when user forgot to reset the position.
+            buf->pos(0);
+            payload_bytes += static_cast<uint64_t>(buf->size());
+            ptr<log_entry> log( cs_new<log_entry>
+                                ( 0, *it, log_val_type::app_log ) );
+            req->log_entries().push_back(log);
+        }
 
-    return send_msg_to_leader(req, ext_params);
+        allocation_phase = "send_to_leader";
+        return send_msg_to_leader(req, ext_params);
+    } catch (const std::bad_alloc& ex) {
+        p_er("NuRaft append_entries allocation failed: phase=%s "
+             "entries=%zu current_entry=%zu payload_bytes=%" PRIu64 ": %s",
+             allocation_phase, logs.size(), current_entry, payload_bytes,
+             ex.what());
+        throw;
+    }
 }
 
 
