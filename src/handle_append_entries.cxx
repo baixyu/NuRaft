@@ -530,12 +530,35 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     if ((last_log_idx + 1) >= cur_nxt_idx) {
         log_entries = ptr<std::vector<ptr<log_entry>>>();
     } else if (entries_valid) {
-        log_entries = log_store_->log_entries_ext(last_log_idx + 1, end_idx,
-                                                  p.get_next_batch_size_hint_in_bytes());
+        const int64 batch_size_hint = p.get_next_batch_size_hint_in_bytes();
+        const bool log_range_requested = last_log_idx + 1 < end_idx;
+        const bool skip_read_during_backpressure =
+            log_range_requested && batch_size_hint >= 0 &&
+            p.wal_read_backpressured();
+        if (skip_read_during_backpressure) {
+            // The store previously declined this range because its bounded
+            // payload pool was full. Keep sending empty AppendEntries as
+            // heartbeats, but let the per-peer cooldown elapse before retrying
+            // the disk read so an accepted empty response cannot spin this
+            // worker at network round-trip speed.
+            log_entries = cs_new<std::vector<ptr<log_entry>>>();
+        } else {
+            log_entries = log_store_->log_entries_ext(
+                last_log_idx + 1, end_idx, batch_size_hint);
+        }
         if (log_entries == nullptr) {
             p_wn("failed to retrieve log entries: %" PRIu64 " - %" PRIu64,
                  last_log_idx + 1, end_idx);
             entries_valid = false;
+        } else if (log_range_requested && log_entries->empty() &&
+                   batch_size_hint >= 0) {
+            if (!skip_read_during_backpressure) {
+                const auto retry_delay_us = static_cast<int64>(
+                    ctx_->get_params()->heart_beat_interval_) * 1000;
+                p.mark_wal_read_backpressure(retry_delay_us);
+            }
+        } else if (!log_entries->empty()) {
+            p.clear_wal_read_backpressure();
         }
     }
 
@@ -1369,6 +1392,7 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         // which eats up CPU. Then the leader will send heartbeats only.
         need_to_catchup = false;
     }
+    if (p->wal_read_backpressured()) need_to_catchup = false;
 
     // This may not be a leader anymore,
     // such as the response was sent out long time ago

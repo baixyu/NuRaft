@@ -57,6 +57,7 @@ public:
         , next_log_idx_(0)
         , last_accepted_log_idx_(0)
         , next_batch_size_hint_in_bytes_(0)
+        , wal_read_backpressure_until_us_(0)
         , matched_idx_(0)
         , last_ack_term_(0)
         , pending_read_index_probe_generation_(0)
@@ -194,6 +195,30 @@ public:
 
     void set_next_batch_size_hint_in_bytes(int64 batch_size) {
         next_batch_size_hint_in_bytes_ = batch_size;
+    }
+
+    void mark_wal_read_backpressure(int64 duration_us) {
+        const auto now_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        const auto bounded_duration_us = duration_us > 0 ? duration_us : 0;
+        wal_read_backpressure_until_us_.store(
+            now_us + static_cast<uint64_t>(bounded_duration_us),
+            std::memory_order_release);
+    }
+
+    bool wal_read_backpressured() const {
+        const auto now_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        return now_us <
+               wal_read_backpressure_until_us_.load(std::memory_order_acquire);
+    }
+
+    void clear_wal_read_backpressure() {
+        wal_read_backpressure_until_us_.store(0, std::memory_order_release);
     }
 
     ulong get_matched_idx() const {
@@ -655,6 +680,10 @@ private:
      * Hint of the next log batch size in bytes.
      */
     std::atomic<int64> next_batch_size_hint_in_bytes_;
+
+    /** Temporary retry cooldown after the log store cannot reserve a bounded
+     *  AppendEntries payload read. Empty heartbeat requests remain allowed. */
+    std::atomic<uint64_t> wal_read_backpressure_until_us_;
 
     /**
      * The last log index whose term matches up with the leader.
