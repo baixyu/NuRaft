@@ -188,6 +188,7 @@ void nuraft_global_mgr::close_raft_server(raft_server* server) {
             if (entry->get() == server) {
                 commit_server_set_.erase(*entry);
                 entry = commit_queue_.erase(entry);
+                server->clear_commit_queue_enqueued();
                 num_aborted_commit++;
                 break;
             } else {
@@ -247,6 +248,7 @@ void nuraft_global_mgr::request_commit(ptr<raft_server> server) {
         // Put into queue.
         commit_queue_.push_back(server);
         commit_server_set_.insert(server);
+        server->record_commit_queue_enqueued();
 
         ptr<logger>& l_ = server->l_;
         p_tr("added commit request to global queue, "
@@ -295,6 +297,7 @@ void nuraft_global_mgr::commit_worker_loop(ptr<worker_handle> handle) {
                 target = *entry;
                 commit_server_set_.erase(target);
                 commit_queue_.pop_front();
+                target->record_commit_queue_dequeued();
                 queue_length = commit_queue_.size();
                 if (!commit_queue_.empty()) {
                     // Other requests are waiting in the queue,

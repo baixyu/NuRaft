@@ -103,6 +103,31 @@ private:
     mutable std::condition_variable cv_;
     uint64_t event_sequence_{0};
 };
+
+/** Cumulative timing for commit work performed by local or shared workers. */
+struct commit_processing_stats_snapshot {
+    uint64_t scheduler_queue_pending{0};
+    uint64_t scheduler_queue_current_wait_us{0};
+    uint64_t scheduler_queue_wait_samples{0};
+    uint64_t scheduler_queue_wait_us{0};
+    uint64_t scheduler_queue_wait_last_us{0};
+    uint64_t scheduler_queue_wait_max_us{0};
+    uint64_t worker_exec_calls{0};
+    uint64_t worker_wall_us{0};
+    uint64_t worker_wall_max_us{0};
+    uint64_t worker_cpu_us{0};
+    uint64_t entry_at_calls{0};
+    uint64_t entry_at_us{0};
+    uint64_t entry_at_last_us{0};
+    uint64_t entry_at_max_us{0};
+    uint64_t entry_at_current_us{0};
+    uint64_t callback_calls{0};
+    uint64_t callback_us{0};
+    uint64_t callback_last_us{0};
+    uint64_t callback_max_us{0};
+    uint64_t callback_current_us{0};
+};
+
 class rpc_exception;
 class snapshot_sync_ctx;
 class state_machine;
@@ -617,6 +642,68 @@ public:
     ulong get_leader_committed_log_idx() const
     { return is_leader() ? get_committed_log_idx() : leader_commit_index_.load(); }
 
+    /** Raw `leader_commit_index_` from AppendEntries; meaningful on followers. */
+    ulong get_received_leader_commit_idx() const
+    { return leader_commit_index_.load(); }
+
+    /** Snapshot low-overhead timing counters for commit processing. */
+    commit_processing_stats_snapshot get_commit_processing_stats() const {
+        commit_processing_stats_snapshot result;
+        const uint64_t now = steady_clock_now_us();
+        const uint64_t queued_at = commit_queue_enqueued_us_.load(
+            std::memory_order_relaxed);
+        result.scheduler_queue_pending = queued_at != 0 ? 1 : 0;
+        if (queued_at != 0) {
+            result.scheduler_queue_current_wait_us =
+                now >= queued_at ? now - queued_at : 0;
+        }
+        result.scheduler_queue_wait_samples =
+            commit_queue_wait_samples_.load(std::memory_order_relaxed);
+        result.scheduler_queue_wait_us =
+            commit_queue_wait_us_.load(std::memory_order_relaxed);
+        result.scheduler_queue_wait_last_us =
+            commit_queue_wait_last_us_.load(std::memory_order_relaxed);
+        result.scheduler_queue_wait_max_us =
+            commit_queue_wait_max_us_.load(std::memory_order_relaxed);
+        result.worker_exec_calls =
+            commit_worker_exec_calls_.load(std::memory_order_relaxed);
+        result.worker_wall_us =
+            commit_worker_wall_us_.load(std::memory_order_relaxed);
+        result.worker_wall_max_us =
+            commit_worker_wall_max_us_.load(std::memory_order_relaxed);
+        result.worker_cpu_us =
+            commit_worker_cpu_us_.load(std::memory_order_relaxed);
+        result.entry_at_calls =
+            commit_entry_at_calls_.load(std::memory_order_relaxed);
+        result.entry_at_us =
+            commit_entry_at_us_.load(std::memory_order_relaxed);
+        result.entry_at_last_us =
+            commit_entry_at_last_us_.load(std::memory_order_relaxed);
+        result.entry_at_max_us =
+            commit_entry_at_max_us_.load(std::memory_order_relaxed);
+        const uint64_t entry_at_started =
+            commit_entry_at_started_us_.load(std::memory_order_relaxed);
+        result.entry_at_current_us =
+            entry_at_started != 0 && now >= entry_at_started
+                ? now - entry_at_started
+                : 0;
+        result.callback_calls =
+            commit_callback_calls_.load(std::memory_order_relaxed);
+        result.callback_us =
+            commit_callback_us_.load(std::memory_order_relaxed);
+        result.callback_last_us =
+            commit_callback_last_us_.load(std::memory_order_relaxed);
+        result.callback_max_us =
+            commit_callback_max_us_.load(std::memory_order_relaxed);
+        const uint64_t callback_started =
+            commit_callback_started_us_.load(std::memory_order_relaxed);
+        result.callback_current_us =
+            callback_started != 0 && now >= callback_started
+                ? now - callback_started
+                : 0;
+        return result;
+    }
+
     /**
      * Get the log index of the first config when this server became a leader.
      * This API can be used for checking if the state machine is fully caught up
@@ -1054,6 +1141,79 @@ public:
     ulong get_last_snapshot_idx() const;
 
 protected:
+    static uint64_t steady_clock_now_us() {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    static void update_timing_max(std::atomic<uint64_t> &maximum,
+                                  uint64_t sample) {
+        uint64_t current = maximum.load(std::memory_order_relaxed);
+        while (current < sample &&
+               !maximum.compare_exchange_weak(current, sample,
+                                              std::memory_order_relaxed)) {
+        }
+    }
+
+    void record_commit_worker_timing(uint64_t wall_us, uint64_t cpu_us) {
+        commit_worker_exec_calls_.fetch_add(1, std::memory_order_relaxed);
+        commit_worker_wall_us_.fetch_add(wall_us, std::memory_order_relaxed);
+        commit_worker_cpu_us_.fetch_add(cpu_us, std::memory_order_relaxed);
+        update_timing_max(commit_worker_wall_max_us_, wall_us);
+    }
+
+    void record_commit_queue_enqueued() {
+        uint64_t now = steady_clock_now_us();
+        if (now == 0) now = 1;
+        uint64_t expected = 0;
+        commit_queue_enqueued_us_.compare_exchange_strong(
+            expected, now, std::memory_order_relaxed);
+    }
+
+    void record_commit_queue_dequeued() {
+        const uint64_t queued_at =
+            commit_queue_enqueued_us_.exchange(0, std::memory_order_relaxed);
+        if (queued_at == 0) return;
+        const uint64_t now = steady_clock_now_us();
+        const uint64_t elapsed_us = now >= queued_at ? now - queued_at : 0;
+        commit_queue_wait_samples_.fetch_add(1, std::memory_order_relaxed);
+        commit_queue_wait_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
+        commit_queue_wait_last_us_.store(elapsed_us, std::memory_order_relaxed);
+        update_timing_max(commit_queue_wait_max_us_, elapsed_us);
+    }
+
+    void clear_commit_queue_enqueued() {
+        commit_queue_enqueued_us_.store(0, std::memory_order_relaxed);
+    }
+
+    void record_commit_entry_at_timing(uint64_t elapsed_us) {
+        commit_entry_at_calls_.fetch_add(1, std::memory_order_relaxed);
+        commit_entry_at_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
+        commit_entry_at_last_us_.store(elapsed_us, std::memory_order_relaxed);
+        update_timing_max(commit_entry_at_max_us_, elapsed_us);
+        commit_entry_at_started_us_.store(0, std::memory_order_relaxed);
+    }
+
+    void record_commit_callback_timing(uint64_t elapsed_us) {
+        commit_callback_calls_.fetch_add(1, std::memory_order_relaxed);
+        commit_callback_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
+        commit_callback_last_us_.store(elapsed_us, std::memory_order_relaxed);
+        update_timing_max(commit_callback_max_us_, elapsed_us);
+        commit_callback_started_us_.store(0, std::memory_order_relaxed);
+    }
+
+    void begin_commit_entry_at_timing() {
+        commit_entry_at_started_us_.store(steady_clock_now_us(),
+                                          std::memory_order_relaxed);
+    }
+
+    void begin_commit_callback_timing() {
+        commit_callback_started_us_.store(steady_clock_now_us(),
+                                          std::memory_order_relaxed);
+    }
+
     typedef std::unordered_map<int32, ptr<peer>>::const_iterator peer_itor;
 
     struct commit_ret_elem;
@@ -1385,6 +1545,30 @@ protected:
      * Actual commit index of state machine.
      */
     std::atomic<ulong> sm_commit_index_;
+
+    // Cumulative commit-worker counters. CPU time is CLOCK_THREAD_CPUTIME_ID
+    // accumulated around commit work, so it measures execution rather than
+    // sleep or scheduler wait. The worker may be local (`nuraft_commit`) or a
+    // shared `nuraft_g_c*` worker, depending on NuRaft configuration.
+    std::atomic<uint64_t> commit_queue_enqueued_us_{0};
+    std::atomic<uint64_t> commit_queue_wait_samples_{0};
+    std::atomic<uint64_t> commit_queue_wait_us_{0};
+    std::atomic<uint64_t> commit_queue_wait_last_us_{0};
+    std::atomic<uint64_t> commit_queue_wait_max_us_{0};
+    std::atomic<uint64_t> commit_worker_exec_calls_{0};
+    std::atomic<uint64_t> commit_worker_wall_us_{0};
+    std::atomic<uint64_t> commit_worker_wall_max_us_{0};
+    std::atomic<uint64_t> commit_worker_cpu_us_{0};
+    std::atomic<uint64_t> commit_entry_at_calls_{0};
+    std::atomic<uint64_t> commit_entry_at_us_{0};
+    std::atomic<uint64_t> commit_entry_at_last_us_{0};
+    std::atomic<uint64_t> commit_entry_at_max_us_{0};
+    std::atomic<uint64_t> commit_entry_at_started_us_{0};
+    std::atomic<uint64_t> commit_callback_calls_{0};
+    std::atomic<uint64_t> commit_callback_us_{0};
+    std::atomic<uint64_t> commit_callback_last_us_{0};
+    std::atomic<uint64_t> commit_callback_max_us_{0};
+    std::atomic<uint64_t> commit_callback_started_us_{0};
 
     /**
      * If `grace_period_of_lagging_state_machine_` option is enabled,

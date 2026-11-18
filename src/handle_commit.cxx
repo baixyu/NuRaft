@@ -36,8 +36,31 @@ limitations under the License.
 #include <list>
 #include <sstream>
 #include <random>
+#include <time.h>
 
 namespace nuraft {
+
+namespace {
+
+uint64_t current_thread_cpu_time_ns() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts {};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+               static_cast<uint64_t>(ts.tv_nsec);
+    }
+#endif
+    return 0;
+}
+
+uint64_t elapsed_microseconds(std::chrono::steady_clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+}
+
+}  // namespace
 
 void raft_server::commit(ulong target_idx) {
     if (target_idx > quick_commit_index_) {
@@ -179,6 +202,9 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
         return true;
     }
 
+    const auto worker_started = std::chrono::steady_clock::now();
+    const uint64_t worker_cpu_started_ns = current_thread_cpu_time_ns();
+
     sm_commit_exec_in_progress_ = true;
     // Clear the flag automatically once we exit this function.
     struct ExecCommitAutoCleaner {
@@ -231,7 +257,10 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
         p_tr( "commit upto %" PRIu64 ", current idx %" PRIu64 "\n",
               quick_commit_index_.load(), index_to_commit );
 
+        begin_commit_entry_at_timing();
+        const auto entry_at_started = std::chrono::steady_clock::now();
         ptr<log_entry> le = log_store_->entry_at(index_to_commit);
+        record_commit_entry_at_timing(elapsed_microseconds(entry_at_started));
         if (!le)
         {
             // LCOV_EXCL_START
@@ -253,7 +282,10 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
         }
 
         if (le->get_val_type() == log_val_type::app_log) {
+            begin_commit_callback_timing();
+            const auto callback_started = std::chrono::steady_clock::now();
             commit_app_log(index_to_commit, le, need_to_handle_commit_elem);
+            record_commit_callback_timing(elapsed_microseconds(callback_started));
 
         } else if (le->get_val_type() == log_val_type::conf) {
             commit_conf(index_to_commit, le);
@@ -296,6 +328,14 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
             (void) ctx_->cb_func_.call(cb_func::BecomeFresh, &param);
         }
     }
+    const uint64_t worker_cpu_finished_ns = current_thread_cpu_time_ns();
+    const uint64_t worker_cpu_us =
+        worker_cpu_finished_ns >= worker_cpu_started_ns &&
+                worker_cpu_started_ns != 0
+            ? (worker_cpu_finished_ns - worker_cpu_started_ns) / 1000
+            : 0;
+    record_commit_worker_timing(elapsed_microseconds(worker_started),
+                                worker_cpu_us);
     return finished_in_time;
 }
 
